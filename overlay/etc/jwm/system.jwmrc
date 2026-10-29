@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<JWM>
+  <!-- Large targets and high contrast are intentional: this is a 300 ppi,
+       touch-only, grayscale display. -->
+  <RootMenu onroot="123" height="104">
+    <Program label="Cyberdeck Home">/usr/local/bin/deck-home</Program>
+    <Program label="Terminal">/usr/local/bin/kindle-terminal</Program>
+    <Program label="Art Mode">/usr/local/bin/artgen show-latest</Program>
+    <Program label="Web browser">/usr/local/bin/deck-web home</Program>
+    <Separator/>
+    <Program label="Show / hide keyboard">/usr/local/bin/kindle-keyboard toggle</Program>
+    <Program label="Close active window">/usr/local/bin/kindle-close-window</Program>
+    <Separator/>
+    <Program label="Sleep Kindle">/usr/local/bin/deck-exit sleep</Program>
+    <Program label="Return to Kindle">/usr/local/bin/deck-exit reader</Program>
+  </RootMenu>
+
+  <Group>
+    <Class>Onboard</Class>
+    <Option>nolist</Option>
+    <Option>sticky</Option>
+    <Option>layer:above</Option>
+  </Group>
+
+  <Group>
+    <Name>Onboard</Name>
+    <Option>nolist</Option>
+    <Option>sticky</Option>
+    <Option>layer:above</Option>
+  </Group>
+
+  <Desktops width="1" height="1">
+    <Background type="solid">#ffffff</Background>
+  </Desktops>
+
+  <WindowStyle>
+    <Font>Sans-34:bold</Font>
+    <Width>6</Width>
+    <Height>88</Height>
+    <Corner>0</Corner>
+    <Foreground>#222222</Foreground>
+    <Background>#eeeeee:#c8c8c8</Background>
+    <Active>
+      <Foreground>#000000</Foreground>
+      <Background>#ffffff:#d8d8d8</Background>
+    </Active>
+  </WindowStyle>
+
+  <Include>exec:/usr/local/bin/kindle-panel-config</Include>
+
+  <TrayStyle>
+    <Font>Sans-30:bold</Font>
+    <Background>#ffffff</Background>
+    <Foreground>#000000</Foreground>
+    <Outline>#000000</Outline>
+    <Opacity>1.0</Opacity>
+  </TrayStyle>
+
+  <TaskListStyle>
+    <Font>Sans-28</Font>
+    <Foreground>#222222</Foreground>
+    <Background>#ffffff</Background>
+    <Active>
+      <Foreground>#000000</Foreground>
+      <Background>#d0d0d0</Background>
+    </Active>
+  </TaskListStyle>
+
+  <MenuStyle>
+    <Font>Sans-34</Font>
+    <Foreground>#000000</Foreground>
+    <Background>#ffffff</Background>
+    <Active>
+      <Foreground>#ffffff</Foreground>
+      <Background>#000000</Background>
+    </Active>
+    <Outline>#000000</Outline>
+    <Opacity>1.0</Opacity>
+  </MenuStyle>
+
+  <PopupStyle>
+    <Font>Sans-28</Font>
+    <Foreground>#000000</Foreground>
+    <Background>#ffffff</Background>
+  </PopupStyle>
+
+  <StartupCommand>/usr/local/bin/kindle-onboard</StartupCommand>
+  <StartupCommand>/usr/local/bin/deck-home</StartupCommand>
+  <DoubleClickSpeed>500</DoubleClickSpeed>
+  <DoubleClickDelta>12</DoubleClickDelta>
+  <FocusModel>click</FocusModel>
+  <SnapMode distance="12">border</SnapMode>
+</JWM>

@@ -1,0 +1,5 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+size=$(cat /mnt/kindle/linux/font-size 2>/dev/null)
+case "$size" in 18|22|26|30) ;; *) size=22 ;; esac
+exec xterm -fa 'DejaVu Sans Mono' -fs "$size" -xrm 'XTerm*allowFontOps: true' -maximized "$@"

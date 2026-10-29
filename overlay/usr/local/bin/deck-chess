@@ -1,0 +1,2448 @@
+#!/usr/bin/python3
+"""Touch chess for the Kindle panel.
+
+You play white or black against the Kindle, or two people share the
+board. Lichess is a button on this screen: a live game over Wi-Fi.
+The Kindle's own engine never moves in a Lichess game.
+
+Pieces are the large chess glyphs from Noto Sans Symbols 2,
+which is already in this Alpine image. The family name has to be set
+on its own: a font string ending in 2 is read as a size. Squares stay
+light so both colors read on e-ink, with the darker square on a1.
+The local game is saved at /mnt/kindle/chess/current.fen.
+
+A Lichess token with Board play is read from
+/home/alpine/.config/kindle-chess/lichess.token (private Alpine storage).
+The token is not stored in this program.
+
+There is no sound or animation.
+"""
+
+import json
+import os
+import socket
+import subprocess
+import email.utils
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+FILES = "abcdefgh"
+RANKS = "12345678"
+START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+VALUES = {"P": 100, "N": 320, "B": 330, "R": 500, "Q": 900, "K": 20000}
+GLYPH = {
+    "K": "♔",
+    "Q": "♕",
+    "R": "♖",
+    "B": "♗",
+    "N": "♘",
+    "P": "♙",
+    "k": "♚",
+    "q": "♛",
+    "r": "♜",
+    "b": "♝",
+    "n": "♞",
+    "p": "♟",
+}
+
+
+def sq_name(sq):
+    return FILES[sq % 8] + RANKS[sq // 8]
+
+
+def parse_sq(text):
+    if len(text) != 2 or text[0] not in FILES or text[1] not in RANKS:
+        return None
+    return FILES.index(text[0]) + RANKS.index(text[1]) * 8
+
+
+class Game(object):
+    def __init__(self):
+        self.board = ["."] * 64
+        self.turn = "w"
+        self.castle = set()
+        self.ep = None
+        self.half = 0
+        self.full = 1
+        self.stack = []
+        self.keys = []
+        self.set_fen(START)
+
+    def set_fen(self, fen):
+        parts = fen.split()
+        self.board = ["."] * 64
+        rank = 7
+        for row in parts[0].split("/"):
+            file = 0
+            for char in row:
+                if char.isdigit():
+                    file += int(char)
+                else:
+                    self.board[rank * 8 + file] = char
+                    file += 1
+            rank -= 1
+        self.turn = parts[1]
+        self.castle = set() if parts[2] == "-" else set(parts[2])
+        self.ep = None if parts[3] == "-" else parse_sq(parts[3])
+        self.half = int(parts[4]) if len(parts) > 4 else 0
+        self.full = int(parts[5]) if len(parts) > 5 else 1
+        self.stack = []
+        self.keys = [self.key()]
+
+    def fen(self):
+        rows = []
+        for rank in range(7, -1, -1):
+            row = ""
+            empty = 0
+            for file in range(8):
+                piece = self.board[rank * 8 + file]
+                if piece == ".":
+                    empty += 1
+                    continue
+                if empty:
+                    row += str(empty)
+                    empty = 0
+                row += piece
+            if empty:
+                row += str(empty)
+            rows.append(row)
+        castle = "".join(flag for flag in "KQkq" if flag in self.castle) or "-"
+        ep = sq_name(self.ep) if self.ep is not None else "-"
+        return "%s %s %s %s %s %s" % (
+            "/".join(rows),
+            self.turn,
+            castle,
+            ep,
+            self.half,
+            self.full,
+        )
+
+    def key(self):
+        castle = "".join(flag for flag in "KQkq" if flag in self.castle)
+        ep = self.ep if self.ep is not None else -1
+        return (tuple(self.board), self.turn, castle, ep)
+
+    def snapshot(self):
+        return (
+            self.board[:],
+            self.turn,
+            frozenset(self.castle),
+            self.ep,
+            self.half,
+            self.full,
+            self.keys[:],
+        )
+
+    def restore(self, snap):
+        board, turn, castle, ep, half, full, keys = snap
+        self.board = board
+        self.turn = turn
+        self.castle = set(castle)
+        self.ep = ep
+        self.half = half
+        self.full = full
+        self.keys = keys
+
+    def make(self, move):
+        self.stack.append(self.snapshot())
+        frm, to, promo, kind = move
+        piece = self.board[frm]
+        captured = self.board[to]
+        self.board[frm] = "."
+        self.board[to] = piece
+        if kind == "e":
+            cap_sq = to - 8 if self.turn == "w" else to + 8
+            self.board[cap_sq] = "."
+            captured = "P" if self.turn == "b" else "p"
+        if kind == "c":
+            if to > frm:
+                rook_from, rook_to = frm + 3, frm + 1
+            else:
+                rook_from, rook_to = frm - 4, frm - 1
+            self.board[rook_to] = self.board[rook_from]
+            self.board[rook_from] = "."
+        if promo:
+            self.board[to] = promo if piece.isupper() else promo.lower()
+        self._rights(frm, to, piece)
+        if piece in "Pp" and abs(to - frm) == 16:
+            self.ep = (frm + to) // 2
+        else:
+            self.ep = None
+        if piece in "Pp" or captured != ".":
+            self.half = 0
+        else:
+            self.half += 1
+        if self.turn == "b":
+            self.full += 1
+        self.turn = "b" if self.turn == "w" else "w"
+        self.keys.append(self.key())
+
+    def unmake(self):
+        self.restore(self.stack.pop())
+
+    def _rights(self, frm, to, piece):
+        if piece == "K":
+            self.castle -= {"K", "Q"}
+        elif piece == "k":
+            self.castle -= {"k", "q"}
+        for square, flag in ((0, "Q"), (7, "K"), (56, "q"), (63, "k")):
+            if frm == square or to == square:
+                self.castle.discard(flag)
+
+    def is_attacked(self, sq, by_white):
+        file = sq % 8
+        rank = sq // 8
+        if by_white:
+            for delta in (-1, 1):
+                nf, nr = file + delta, rank - 1
+                if 0 <= nf < 8 and nr >= 0 and self.board[nr * 8 + nf] == "P":
+                    return True
+        else:
+            for delta in (-1, 1):
+                nf, nr = file + delta, rank + 1
+                if 0 <= nf < 8 and nr < 8 and self.board[nr * 8 + nf] == "p":
+                    return True
+        knight = "N" if by_white else "n"
+        for df, dr in ((1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)):
+            nf, nr = file + df, rank + dr
+            if 0 <= nf < 8 and 0 <= nr < 8 and self.board[nr * 8 + nf] == knight:
+                return True
+        king = "K" if by_white else "k"
+        for df in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                if df == 0 and dr == 0:
+                    continue
+                nf, nr = file + df, rank + dr
+                if 0 <= nf < 8 and 0 <= nr < 8 and self.board[nr * 8 + nf] == king:
+                    return True
+        bishop = "B" if by_white else "b"
+        queen = "Q" if by_white else "q"
+        rook = "R" if by_white else "r"
+        for df, dr in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+            nf, nr = file + df, rank + dr
+            while 0 <= nf < 8 and 0 <= nr < 8:
+                found = self.board[nr * 8 + nf]
+                if found != ".":
+                    if found == bishop or found == queen:
+                        return True
+                    break
+                nf += df
+                nr += dr
+        for df, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nf, nr = file + df, rank + dr
+            while 0 <= nf < 8 and 0 <= nr < 8:
+                found = self.board[nr * 8 + nf]
+                if found != ".":
+                    if found == rook or found == queen:
+                        return True
+                    break
+                nf += df
+                nr += dr
+        return False
+
+    def king_sq(self, white):
+        want = "K" if white else "k"
+        return self.board.index(want)
+
+    def in_check(self, white=None):
+        if white is None:
+            white = self.turn == "w"
+        return self.is_attacked(self.king_sq(white), not white)
+
+    def _add_pawn(self, moves, frm, to, promo_rank):
+        if to // 8 == promo_rank:
+            for promo in "QRBN":
+                moves.append((frm, to, promo, ""))
+        else:
+            moves.append((frm, to, "", ""))
+
+    def pseudo(self):
+        moves = []
+        white = self.turn == "w"
+        for sq, piece in enumerate(self.board):
+            if piece == "." or piece.isupper() != white:
+                continue
+            file, rank = sq % 8, sq // 8
+            kind = piece.upper()
+            if kind == "P":
+                step = 8 if white else -8
+                start = 1 if white else 6
+                promo_rank = 7 if white else 0
+                nxt = sq + step
+                if 0 <= nxt < 64 and self.board[nxt] == ".":
+                    self._add_pawn(moves, sq, nxt, promo_rank)
+                    if rank == start and self.board[sq + step * 2] == ".":
+                        moves.append((sq, sq + step * 2, "", ""))
+                for cap in (step - 1, step + 1):
+                    dest = sq + cap
+                    if dest < 0 or dest > 63:
+                        continue
+                    if abs((dest % 8) - file) != 1:
+                        continue
+                    victim = self.board[dest]
+                    if victim != "." and victim.isupper() != white:
+                        self._add_pawn(moves, sq, dest, promo_rank)
+                    elif self.ep is not None and dest == self.ep:
+                        moves.append((sq, dest, "", "e"))
+            elif kind == "N":
+                for df, dr in ((1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)):
+                    nf, nr = file + df, rank + dr
+                    if 0 <= nf < 8 and 0 <= nr < 8:
+                        dest = nr * 8 + nf
+                        victim = self.board[dest]
+                        if victim == "." or victim.isupper() != white:
+                            moves.append((sq, dest, "", ""))
+            elif kind == "K":
+                for df in (-1, 0, 1):
+                    for dr in (-1, 0, 1):
+                        if df == 0 and dr == 0:
+                            continue
+                        nf, nr = file + df, rank + dr
+                        if 0 <= nf < 8 and 0 <= nr < 8:
+                            dest = nr * 8 + nf
+                            victim = self.board[dest]
+                            if victim == "." or victim.isupper() != white:
+                                moves.append((sq, dest, "", ""))
+                self._castle(moves, white, sq)
+            else:
+                steps = []
+                if kind in "RQ":
+                    steps += [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                if kind in "BQ":
+                    steps += [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+                for df, dr in steps:
+                    nf, nr = file + df, rank + dr
+                    while 0 <= nf < 8 and 0 <= nr < 8:
+                        dest = nr * 8 + nf
+                        victim = self.board[dest]
+                        if victim == ".":
+                            moves.append((sq, dest, "", ""))
+                        else:
+                            if victim.isupper() != white:
+                                moves.append((sq, dest, "", ""))
+                            break
+                        nf += df
+                        nr += dr
+        return moves
+
+    def _castle(self, moves, white, king_sq):
+        if self.in_check(white):
+            return
+        rank = 0 if white else 7
+        king_flag, queen_flag = ("K", "Q") if white else ("k", "q")
+        enemy = not white
+        if king_flag in self.castle:
+            f1, g1 = rank * 8 + 5, rank * 8 + 6
+            if self.board[f1] == "." and self.board[g1] == ".":
+                if not self.is_attacked(f1, enemy) and not self.is_attacked(g1, enemy):
+                    moves.append((king_sq, g1, "", "c"))
+        if queen_flag in self.castle:
+            b1, c1, d1 = rank * 8 + 1, rank * 8 + 2, rank * 8 + 3
+            if self.board[b1] == "." and self.board[c1] == "." and self.board[d1] == ".":
+                if not self.is_attacked(d1, enemy) and not self.is_attacked(c1, enemy):
+                    moves.append((king_sq, c1, "", "c"))
+
+    def legal_moves(self):
+        white = self.turn == "w"
+        found = []
+        for move in self.pseudo():
+            # A king is never captured. The game already ended one move earlier.
+            if self.board[move[1]] in "Kk":
+                continue
+            self.make(move)
+            illegal = self.in_check(white)
+            self.unmake()
+            if not illegal:
+                found.append(move)
+        return found
+
+    def result(self):
+        if self.keys.count(self.key()) >= 3:
+            return "draw", "Draw by repetition."
+        if self.half >= 100:
+            return "draw", "Draw by the fifty-move rule."
+        moves = self.legal_moves()
+        if moves:
+            if self._bare_kings():
+                return "draw", "Draw. Not enough pieces to mate."
+            if self.in_check():
+                return "check", "Check."
+            return "", "White to move." if self.turn == "w" else "Black to move."
+        if self.in_check():
+            winner = "Black" if self.turn == "w" else "White"
+            return "mate", "Checkmate. %s wins." % winner
+        return "draw", "Stalemate."
+
+    def _bare_kings(self):
+        extra = [piece for piece in self.board if piece not in ".Kk"]
+        if not extra:
+            return True
+        if len(extra) == 1 and extra[0].upper() in "BN":
+            return True
+        return False
+
+
+def perft(game, depth):
+    if depth == 0:
+        return 1
+    total = 0
+    for move in game.legal_moves():
+        game.make(move)
+        total += perft(game, depth - 1)
+        game.unmake()
+    return total
+
+
+# Piece-square tables from white's point of view. Black reads them reversed.
+PAWN_PST = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+    5, 5, 10, 25, 25, 10, 5, 5,
+    0, 0, 0, 20, 20, 0, 0, 0,
+    5, -5, -10, 0, 0, -10, -5, 5,
+    5, 10, 10, -20, -20, 10, 10, 5,
+    0, 0, 0, 0, 0, 0, 0, 0,
+]
+KNIGHT_PST = [
+    -50, -40, -30, -30, -30, -30, -40, -50,
+    -40, -20, 0, 0, 0, 0, -20, -40,
+    -30, 0, 10, 15, 15, 10, 0, -30,
+    -30, 5, 15, 20, 20, 15, 5, -30,
+    -30, 0, 15, 20, 20, 15, 0, -30,
+    -30, 5, 10, 15, 15, 10, 5, -30,
+    -40, -20, 0, 5, 5, 0, -20, -40,
+    -50, -40, -30, -30, -30, -30, -40, -50,
+]
+
+
+def evaluate(game):
+    score = 0
+    for sq, piece in enumerate(game.board):
+        if piece == ".":
+            continue
+        value = VALUES[piece.upper()]
+        if piece.upper() == "P":
+            table = PAWN_PST[sq if piece.isupper() else 63 - sq]
+            value += table
+        elif piece.upper() == "N":
+            table = KNIGHT_PST[sq if piece.isupper() else 63 - sq]
+            value += table
+        if piece.isupper():
+            score += value
+        else:
+            score -= value
+    return score if game.turn == "w" else -score
+
+
+def ordered(game, moves):
+    def rank(move):
+        _frm, to, promo, kind = move
+        victim = game.board[to]
+        score = 0
+        if victim != ".":
+            score += 10 * VALUES[victim.upper()] - VALUES[game.board[move[0]].upper()]
+        if kind == "e":
+            score += 300
+        if promo == "Q":
+            score += 800
+        return score
+
+    return sorted(moves, key=rank, reverse=True)
+
+
+def search(game, depth, alpha, beta, deadline):
+    if time.monotonic() > deadline:
+        return None
+    if game.keys.count(game.key()) >= 3 or game.half >= 100:
+        return 0
+    moves = game.legal_moves()
+    if not moves:
+        if game.in_check():
+            return -30000 + (8 - depth)
+        return 0
+    if depth == 0:
+        return evaluate(game)
+    best = -10 ** 9
+    for move in ordered(game, moves):
+        game.make(move)
+        score = search(game, depth - 1, -beta, -alpha, deadline)
+        game.unmake()
+        if score is None:
+            return None
+        score = -score
+        if score > best:
+            best = score
+        if score > alpha:
+            alpha = score
+        if alpha >= beta:
+            break
+    return best
+
+
+def choose_move(game, seconds=1.1):
+    deadline = time.monotonic() + seconds
+    moves = ordered(game, game.legal_moves())
+    if not moves:
+        return None
+    best = moves[0]
+    for depth in (1, 2, 3):
+        if time.monotonic() > deadline:
+            break
+        depth_best = best
+        depth_score = -10 ** 9
+        finished = True
+        for move in moves:
+            game.make(move)
+            score = search(game, depth - 1, -10 ** 9, 10 ** 9, deadline)
+            game.unmake()
+            if score is None:
+                finished = False
+                break
+            score = -score
+            if score > depth_score:
+                depth_score = score
+                depth_best = move
+        if finished:
+            best = depth_best
+            moves = [best] + [move for move in moves if move != best]
+    return best
+
+
+SAVE_DIR = "/mnt/kindle/chess"
+SAVE_PATH = SAVE_DIR + "/current.fen"
+
+
+def load_saved():
+    try:
+        with open(SAVE_PATH, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    if not lines:
+        return None
+    mode = "w"
+    if lines[0].startswith("mode "):
+        mode = lines[0].split(None, 1)[1].strip()
+        fen = lines[1] if len(lines) > 1 else START
+    else:
+        fen = lines[0]
+    game = Game()
+    try:
+        game.set_fen(fen)
+    except (IndexError, ValueError):
+        return None
+    if mode not in ("w", "b", "both"):
+        mode = "w"
+    return game, mode
+
+
+def save_game(game, mode):
+    try:
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        temporary = SAVE_PATH + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write("mode %s\n%s\n" % (mode, game.fen()))
+        os.replace(temporary, SAVE_PATH)
+    except OSError:
+        pass
+
+
+LICHESS = "https://lichess.org"
+APPLICATION_ID = "org.cyberdeck.Chess"
+TOKEN_PATH = "/home/alpine/.config/kindle-chess/lichess.token"
+TOKEN_HELP = (
+    "On your computer, open 127.0.0.1:8765/lichess and sign in. "
+    "This screen connects automatically when the login arrives. "
+    "Or enter a personal token with Board play below."
+)
+
+
+def token_ok(token):
+    token = (token or "").strip()
+    return 0 < len(token) <= 2048 and token.isascii() and all(ch.isalnum() or ch == "_" for ch in token)
+
+
+def load_token(path=TOKEN_PATH):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except OSError:
+        if path == TOKEN_PATH:
+            legacy = load_token(SAVE_DIR + "/lichess.token")
+            if legacy:
+                save_token(legacy)
+            return legacy
+        return ""
+    return token if token_ok(token) else ""
+
+
+def save_token(token, path=TOKEN_PATH):
+    token = token.strip()
+    if not token_ok(token):
+        raise ValueError("bad token")
+    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    temporary = path + ".tmp"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(token + "\n")
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+
+
+def game_id_ok(text):
+    return isinstance(text, str) and 8 <= len(text) <= 12 and text.isalnum()
+
+
+def username_ok(name):
+    return isinstance(name, str) and 1 <= len(name) <= 30 and all(
+        ch.isalnum() or ch in "-_" for ch in name
+    )
+
+
+def game_api_path(game_id, suffix):
+    if not game_id_ok(game_id) or not suffix:
+        return None
+    if not all(ch.isalnum() or ch in "-/" for ch in suffix):
+        return None
+    return "/api/board/game/%s/%s" % (game_id, suffix)
+
+
+def uci_of(move):
+    text = sq_name(move[0]) + sq_name(move[1])
+    if move[2]:
+        text += move[2].lower()
+    return text
+
+
+def move_from_uci(game, uci):
+    if not isinstance(uci, str) or len(uci) not in (4, 5):
+        return None
+    frm = parse_sq(uci[0:2])
+    to = parse_sq(uci[2:4])
+    promo = uci[4].upper() if len(uci) == 5 else ""
+    if frm is None or to is None:
+        return None
+    if promo and promo not in "QRBN":
+        return None
+    for move in game.legal_moves():
+        if move[0] == frm and move[1] == to and (move[2] or "") == promo:
+            return move
+    return None
+
+
+def replay_moves(initial_fen, moves):
+    game = Game()
+    fen = START if not initial_fen or initial_fen == "startpos" else initial_fen
+    try:
+        game.set_fen(fen)
+    except (IndexError, ValueError):
+        return None
+    for uci in (moves or "").split():
+        move = move_from_uci(game, uci)
+        if move is None:
+            return None
+        game.make(move)
+    return game
+
+
+def board_seek_allowed(minutes, increment):
+    """Lichess board seeks are rapid, classical, or correspondence.
+
+    Public real-time seeks reject bullet and blitz. Estimated length is
+    the clock plus forty increments, and blitz is under eight minutes.
+    """
+    try:
+        minutes = int(minutes)
+        increment = int(increment)
+    except (TypeError, ValueError):
+        return False
+    if minutes < 0 or increment < 0 or minutes > 180 or increment > 180:
+        return False
+    return minutes * 60 + 40 * increment >= 480
+
+
+def format_ms(ms):
+    if ms is None:
+        return ""
+    seconds = max(0, int(ms) // 1000)
+    if seconds >= 86400:
+        days, rem = divmod(seconds, 86400)
+        return "%dd %dh" % (days, rem // 3600)
+    if seconds >= 3600:
+        hours, rem = divmod(seconds, 3600)
+        return "%d:%02d:%02d" % (hours, rem // 60, rem % 60)
+    minutes, sec = divmod(seconds, 60)
+    return "%d:%02d" % (minutes, sec)
+
+
+def ndjson_values(text):
+    values = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        values.append(json.loads(line))
+    return values
+
+
+def lichess_failure(status, body, token=""):
+    if status == 401:
+        return "Lichess refused that token. It needs the Board play permission."
+    if status == 429:
+        return "Lichess asked us to wait. Try again in a minute."
+    if status == 404:
+        return "Lichess could not find that game."
+    if status == 0:
+        text = str(body or "").lower()
+        if any(word in text for word in ("timed out", "name or service", "network", "temporary")):
+            return "The Kindle could not reach Lichess. It needs Wi-Fi."
+        return "The Kindle could not reach Lichess."
+    message = ""
+    try:
+        payload = json.loads(body or "")
+        message = str(payload.get("error") or "")
+    except (ValueError, AttributeError):
+        message = ""
+    if token and token in message:
+        message = message.replace(token, "")
+    message = " ".join(message.split())
+    if len(message) > 140:
+        message = message[:140]
+    if message:
+        return "Lichess said: %s" % message
+    return "Lichess did not accept that (%s)." % status
+
+
+def account_name(body):
+    payload = json.loads(body)
+    return str(payload.get("username") or payload.get("id") or "")
+
+
+def person_name(obj):
+    if not isinstance(obj, dict):
+        return ""
+    return str(obj.get("username") or obj.get("name") or obj.get("id") or "")
+
+
+def first_standard_game(body):
+    payload = json.loads(body)
+    for game in payload.get("nowPlaying") or []:
+        variant = game.get("variant") or {}
+        key = variant.get("key") if isinstance(variant, dict) else variant
+        if key in (None, "standard") and (game.get("compat") or {}).get("board") is not False:
+            return game
+    return None
+
+
+def challenge_summary(challenge):
+    who = person_name(challenge.get("challenger")) or "Someone"
+    control = challenge.get("timeControl") or {}
+    if control.get("show"):
+        clock = str(control.get("show"))
+    elif control.get("type") == "clock":
+        clock = "%d+%d" % (int(control.get("limit") or 0) // 60, int(control.get("increment") or 0))
+    elif control.get("type") == "correspondence":
+        clock = "%s days" % control.get("daysPerTurn", "?")
+    else:
+        clock = str(challenge.get("speed") or "a game")
+    rated = "rated" if challenge.get("rated") else "casual"
+    text = "%s challenges you to %s %s." % (who, clock, rated)
+    limit = control.get("limit")
+    increment = control.get("increment") or 0
+    if control.get("type") == "clock" and limit is not None:
+        if int(limit) + 40 * int(increment) < 480:
+            text += " This is fast for this screen."
+    return text
+
+
+class LichessClient(object):
+    """One token, a few long-lived responses. Closing a response cancels that wait."""
+
+    cooldown = 0.0
+    rate_file = '/tmp/kindle-chess-rate-limit'
+
+    def __init__(self, token):
+        self.token = token
+        self._lock = threading.Lock()
+        self._open = []
+        self._epochs = {}
+        self._closed = False
+        try:
+            with open(self.rate_file) as handle:
+                remaining = float(handle.read()) - time.time()
+            if remaining > 0:
+                LichessClient.cooldown = max(LichessClient.cooldown, time.monotonic() + remaining)
+        except (OSError, ValueError):
+            pass
+
+    def close(self):
+        self._closed = True
+        self._close(None)
+
+    def close_role(self, role):
+        with self._lock:
+            self._epochs[role] = self._epochs.get(role, 0) + 1
+        self._close(role)
+
+    def _close(self, role):
+        with self._lock:
+            closing = []
+            kept = []
+            for item in self._open:
+                if role is None or item[0] == role:
+                    closing.append(item[1])
+                else:
+                    kept.append(item)
+            self._open = kept
+        for resp in closing:
+            # readline holds a buffered-reader lock. Never wait for it on GTK.
+            threading.Thread(target=self._interrupt, args=(resp,), daemon=True).start()
+
+    @staticmethod
+    def _interrupt(resp):
+        try:
+            resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+        except (AttributeError, OSError):
+            pass
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+    def call(self, method, path, fields=None):
+        status, body, _resp = self._open_request(method, path, fields, stream=False, role="")
+        return status, body
+
+    def iter_stream(self, method, path, fields=None, role="stream"):
+        status, body, resp = self._open_request(
+            method, path, fields, stream=True, role=role, timeout=45
+        )
+        if resp is None:
+            yield ("error", status, body)
+            return
+        try:
+            while True:
+                try:
+                    line = resp.readline()
+                except TimeoutError:
+                    yield ("timeout", 0, "")
+                    break
+                except Exception:
+                    yield ("error", 0, "")
+                    break
+                if not line:
+                    break
+                text = line.decode("utf-8", "replace").strip()
+                if not text:
+                    continue
+                try:
+                    yield ("event", 200, json.loads(text))
+                except ValueError:
+                    continue
+        finally:
+            self._discard(resp)
+
+    def _discard(self, resp):
+        try:
+            resp.close()
+        except Exception:
+            pass
+        with self._lock:
+            self._open = [item for item in self._open if item[1] is not resp]
+
+    def _open_request(self, method, path, fields, stream, role, timeout=25):
+        with self._lock:
+            epoch = self._epochs.get(role, 0)
+        if self._closed:
+            return 0, "Connection closed", None
+        if time.monotonic() < self.cooldown:
+            return 429, "Please wait a minute before retrying.", None
+        if fields is not None:
+            data = urllib.parse.urlencode(fields).encode()
+        elif method == "POST":
+            data = b""
+        else:
+            data = None
+        headers = {
+            "Authorization": "Bearer " + self.token,
+            "Accept": "application/x-ndjson" if stream else "application/json",
+            "User-Agent": "kindle-cyberdeck",
+        }
+        if fields is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = urllib.request.Request(LICHESS + path, data=data, headers=headers, method=method)
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", "replace")
+            if exc.code == 429:
+                retry = exc.headers.get('Retry-After', '')
+                try:
+                    seconds = float(retry)
+                except ValueError:
+                    try:
+                        seconds = email.utils.parsedate_to_datetime(retry).timestamp() - time.time()
+                    except (ValueError, TypeError):
+                        seconds = 60
+                seconds = max(60, seconds)
+                LichessClient.cooldown = time.monotonic() + seconds
+                try:
+                    with open(self.rate_file, 'w') as handle:
+                        handle.write(str(time.time() + seconds))
+                except OSError:
+                    pass
+                print('Lichess rate limit: %s %s; retry in %ds' % (method, path, seconds), flush=True)
+            exc.close()
+            return exc.code, raw, None
+        except urllib.error.URLError as exc:
+            return 0, str(getattr(exc, "reason", exc)), None
+        except TimeoutError:
+            return 0, "timed out", None
+        except Exception as exc:
+            return 0, str(exc), None
+        if not stream:
+            try:
+                raw = resp.read().decode("utf-8", "replace")
+                code = resp.status
+            finally:
+                resp.close()
+            return code, raw, None
+        with self._lock:
+            cancelled = self._closed or epoch != self._epochs.get(role, 0)
+            if not cancelled:
+                self._open.append((role, resp))
+        if cancelled:
+            resp.close()
+            return 0, "Connection closed", None
+        if role in ('event', 'game'):
+            print('Lichess %s stream connected' % role, flush=True)
+        return resp.status, "", resp
+
+
+def self_test():
+    game = Game()
+    counts = [perft(game, depth) for depth in (1, 2, 3)]
+    expect = [20, 400, 8902]
+    if counts != expect:
+        raise SystemExit("start perft %s, expected %s" % (counts, expect))
+
+    game.set_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+    kiwipete = [perft(game, 1), perft(game, 2)]
+    if kiwipete != [48, 2039]:
+        raise SystemExit("kiwipete perft %s" % (kiwipete,))
+
+    game.set_fen("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8")
+    if perft(game, 1) != 44:
+        raise SystemExit("promotion perft %s" % perft(game, 1))
+
+    game.set_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2")
+    names = []
+    for move in game.legal_moves():
+        if move[3] == "e":
+            names.append(sq_name(move[0]) + sq_name(move[1]))
+    if names != ["e5d6"]:
+        raise SystemExit("en passant %s" % names)
+
+    game.set_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1")
+    castles = sorted(sq_name(move[1]) for move in game.legal_moves() if move[3] == "c")
+    if castles != ["c1", "g1"]:
+        raise SystemExit("castle %s" % castles)
+
+    game.set_fen("5rk1/8/8/8/8/8/8/R3K2R w KQ - 0 1")
+    castles = sorted(sq_name(move[1]) for move in game.legal_moves() if move[3] == "c")
+    if castles != ["c1"]:
+        raise SystemExit("castle through check %s" % castles)
+
+    game.set_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
+    kind, text = game.result()
+    if kind != "draw" or "Stalemate" not in text:
+        raise SystemExit("stalemate %s %s" % (kind, text))
+
+    game.set_fen("7k/8/6K1/5Q2/8/8/8/8 w - - 0 1")
+    mate = choose_move(game, seconds=2)
+    if mate is None:
+        raise SystemExit("missed mate")
+    game.make(mate)
+    kind, text = game.result()
+    if kind != "mate":
+        raise SystemExit("engine played %s, not mate (%s)" % (sq_name(mate[0]) + sq_name(mate[1]), text))
+
+    game.set_fen(START)
+    first = choose_move(game, seconds=2)
+    if first not in game.legal_moves():
+        raise SystemExit("engine move is illegal")
+
+    played = replay_moves("startpos", "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 e1g1")
+    if played is None or played.board[6] != "K" or played.board[5] != "R":
+        raise SystemExit("lichess replay did not castle")
+    promo = replay_moves("k7/4P3/8/8/8/8/8/4K3 w - - 0 1", "e7e8q")
+    if promo is None or promo.board[parse_sq("e8")] != "Q":
+        raise SystemExit("lichess promotion replay failed")
+    ep = replay_moves("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2", "e5d6")
+    if ep is None or ep.board[parse_sq("d5")] != "." or ep.board[parse_sq("d6")] != "P":
+        raise SystemExit("lichess en passant replay failed")
+    if replay_moves(START, "e2e5") is not None:
+        raise SystemExit("illegal lichess move was accepted")
+    if board_seek_allowed(5, 0) or board_seek_allowed(3, 2):
+        raise SystemExit("blitz seek was allowed")
+    if not board_seek_allowed(10, 0) or not board_seek_allowed(10, 5):
+        raise SystemExit("rapid seek was rejected")
+    if not board_seek_allowed(15, 10) or not board_seek_allowed(30, 0):
+        raise SystemExit("classical seek was rejected")
+    if token_ok("") or token_ok("has space") or token_ok("lip_ok\nsecond"):
+        raise SystemExit("bad token was accepted")
+    if not token_ok("lip_Test_1"):
+        raise SystemExit("good token was rejected")
+    if game_id_ok("../etc") or game_id_ok("short") or not game_id_ok("abcdefgh"):
+        raise SystemExit("game id check failed")
+    if game_api_path("abcdefgh", "move/e2e4") != "/api/board/game/abcdefgh/move/e2e4":
+        raise SystemExit("move path failed")
+    if game_api_path("abcdefgh", "../resign") is not None:
+        raise SystemExit("path escape was accepted")
+    secret = "lip_supersecret"
+    refused = lichess_failure(401, '{"error":"%s"}' % secret, secret)
+    if secret in refused or "refused" not in refused.lower() and "token" not in refused.lower():
+        raise SystemExit("token leaked or 401 text is wrong: %s" % refused)
+    scrubbed = lichess_failure(400, '{"error":"nope %s"}' % secret, secret)
+    if secret in scrubbed or "nope" not in scrubbed:
+        raise SystemExit("error text kept the token")
+    offline = lichess_failure(0, "timed out")
+    if "Wi-Fi" not in offline:
+        raise SystemExit("offline text: %s" % offline)
+    events = ndjson_values('\n{"type":"gameStart"}\n\n{"type":"challenge"}\n')
+    if [event["type"] for event in events] != ["gameStart", "challenge"]:
+        raise SystemExit("ndjson parse failed")
+    if account_name('{"username":"Ada"}') != "Ada":
+        raise SystemExit("account name failed")
+    playing = first_standard_game(
+        '{"nowPlaying":[{"gameId":"aaaaaaaa","variant":{"key":"crazyhouse"}},'
+        '{"gameId":"bbbbbbbb","variant":{"key":"standard"},"color":"black"}],"nbMyTurn":1}'
+    )
+    if not playing or playing["gameId"] != "bbbbbbbb":
+        raise SystemExit("standard game pick failed")
+    summary = challenge_summary(
+        {
+            "challenger": {"name": "Ada"},
+            "rated": False,
+            "timeControl": {"type": "clock", "limit": 180, "increment": 0, "show": "3+0"},
+            "speed": "blitz",
+        }
+    )
+    if "Ada" not in summary or "fast" not in summary:
+        raise SystemExit("challenge summary: %s" % summary)
+    if format_ms(90 * 1000) != "1:30" or format_ms(90000 * 1000)[:2] != "1d":
+        raise SystemExit("clock format failed")
+    token_dir = "/tmp/kindle-chess-token-test"
+    os.makedirs(token_dir, exist_ok=True)
+    token_file = token_dir + "/lichess.token"
+    try:
+        save_token("lip_Test_1", token_file)
+        if load_token(token_file) != "lip_Test_1":
+            raise SystemExit("token file round trip failed")
+        with open(token_file, "w", encoding="utf-8") as handle:
+            handle.write("not a token\n")
+        if load_token(token_file):
+            raise SystemExit("bad token file was loaded")
+    finally:
+        try:
+            os.remove(token_file)
+            os.rmdir(token_dir)
+        except OSError:
+            pass
+    print("chess self-test ok")
+    return 0
+
+
+def _focus_legacy_instance():
+    """Keep an already-running pre-single-instance board during an upgrade."""
+    try:
+        entries = os.listdir('/proc')
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open('/proc/' + entry + '/cmdline', 'rb') as handle:
+                args = handle.read().split(b'\0')
+            if len(args) < 2 or args[1].decode(errors='replace') != os.path.abspath(__file__):
+                continue
+            found = subprocess.run(['xdotool', 'search', '--onlyvisible', '--pid', entry],
+                capture_output=True, text=True, timeout=2)
+            windows = [line for line in found.stdout.splitlines() if line.isdigit()]
+            if windows:
+                subprocess.run(['xdotool', 'windowactivate', windows[-1]],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
+def main():
+    if "--self-test" in sys.argv:
+        return self_test()
+
+    if _focus_legacy_instance():
+        return 0
+
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("Pango", "1.0")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo
+
+    class Board(Gtk.DrawingArea):
+        def __init__(self, app):
+            super().__init__()
+            self.app = app
+            self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+            self.connect("draw", self._draw)
+            self.connect("button-press-event", self._press)
+            self.set_size_request(240, 240)
+
+        def _geom(self):
+            width = self.get_allocated_width()
+            height = self.get_allocated_height()
+            side = max(8, min(width, height))
+            square = side // 8
+            board = square * 8
+            return (width - board) // 2, (height - board) // 2, square
+
+        def _cell(self, sq):
+            file, rank = sq % 8, sq // 8
+            if self.app.mode == "b":
+                file = 7 - file
+            else:
+                rank = 7 - rank
+            ox, oy, square = self._geom()
+            return ox + file * square, oy + rank * square, square
+
+        def _sq_at(self, x, y):
+            ox, oy, square = self._geom()
+            if square <= 0:
+                return None
+            file = int((x - ox) // square)
+            rank = int((y - oy) // square)
+            if not (0 <= file < 8 and 0 <= rank < 8):
+                return None
+            if self.app.mode == "b":
+                file = 7 - file
+            else:
+                rank = 7 - rank
+            return rank * 8 + file
+
+        def _draw(self, _widget, ctx):
+            app = self.app
+            ox, oy, square = self._geom()
+            for sq in range(64):
+                x, y, _side = self._cell(sq)
+                light = (sq // 8 + sq % 8) % 2 == 1
+                if sq in (app.last_from, app.last_to):
+                    ctx.set_source_rgb(0.86, 0.86, 0.86)
+                elif light:
+                    ctx.set_source_rgb(1, 1, 1)
+                else:
+                    ctx.set_source_rgb(0.80, 0.80, 0.80)
+                ctx.rectangle(x, y, square, square)
+                ctx.fill()
+                if sq == app.selected:
+                    ctx.set_source_rgb(0, 0, 0)
+                    ctx.set_line_width(6)
+                    ctx.rectangle(x + 3, y + 3, square - 6, square - 6)
+                    ctx.stroke()
+                elif sq in (app.last_from, app.last_to):
+                    ctx.set_source_rgb(0, 0, 0)
+                    ctx.set_line_width(3)
+                    ctx.rectangle(x + 7, y + 7, square - 14, square - 14)
+                    ctx.stroke()
+                if sq in app.targets:
+                    ctx.set_source_rgb(0, 0, 0)
+                    ctx.arc(x + square / 2, y + square / 2, square * 0.12, 0, 6.3)
+                    if app.game.board[sq] == "." and sq != app.game.ep:
+                        ctx.fill()
+                    else:
+                        ctx.set_line_width(5)
+                        ctx.stroke()
+                piece = app.game.board[sq]
+                if piece != ".":
+                    self._pango(ctx, GLYPH[piece], square * 0.68, x, y, square, "Noto Sans Symbols 2")
+                ctx.set_source_rgb(0.25, 0.25, 0.25)
+                if rank_is_near_player(sq, app.mode):
+                    self._pango(
+                        ctx, FILES[sq % 8], max(16, square * 0.16),
+                        x + square * 0.62, y + square * 0.72, square * 0.34, "Noto Sans",
+                    )
+                if file_is_left(sq, app.mode):
+                    self._pango(
+                        ctx, RANKS[sq // 8], max(16, square * 0.16),
+                        x + 4, y + 2, square * 0.34, "Noto Sans",
+                    )
+            ctx.set_source_rgb(0, 0, 0)
+            ctx.set_line_width(4)
+            ctx.rectangle(ox + 1, oy + 1, square * 8 - 2, square * 8 - 2)
+            ctx.stroke()
+            return False
+
+        def _pango(self, ctx, text, size, x, y, box, family):
+            layout = PangoCairo.create_layout(ctx)
+            layout.set_text(text, -1)
+            desc = Pango.FontDescription()
+            desc.set_family(family)
+            desc.set_absolute_size(int(size * Pango.SCALE))
+            layout.set_font_description(desc)
+            ink, _logical = layout.get_extents()
+            scale = Pango.SCALE
+            ink_w = ink.width / scale
+            ink_h = ink.height / scale
+            ctx.set_source_rgb(0, 0, 0)
+            ctx.move_to(
+                x + (box - ink_w) / 2 - ink.x / scale,
+                y + (box - ink_h) / 2 - ink.y / scale,
+            )
+            PangoCairo.show_layout(ctx, layout)
+
+        def _press(self, _widget, event):
+            self.app.on_square(self._sq_at(event.x, event.y))
+            return True
+
+    def rank_is_near_player(sq, mode):
+        rank = sq // 8
+        return rank == 7 if mode == "b" else rank == 0
+
+    def file_is_left(sq, mode):
+        file = sq % 8
+        return file == 7 if mode == "b" else file == 0
+
+    class Chess(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="Chess")
+            loaded = load_saved()
+            if loaded:
+                self.game, self.mode = loaded
+            else:
+                self.game = Game()
+                self.mode = "w"
+            self.selected = None
+            self.targets = {}
+            self.last_from = None
+            self.last_to = None
+            self.promo = None
+            self.thinking = False
+            self.lichess = False
+            self.closing = False
+            self.session = 0
+            self.client = None
+            self.token = ""
+            self.username = ""
+            self.asking_token = False
+            self.game_id = ""
+            self.my_color = "w"
+            self.opponent = ""
+            self.initial_fen = START
+            self.server_moves = ""
+            self.status_name = ""
+            self.winner = ""
+            self.wtime = None
+            self.btime = None
+            self.clock_mark = 0.0
+            self.their_draw = False
+            self.can_claim = False
+            self.gone_note = ""
+            self.seeking = False
+            self.seek_gen = 0
+            self.seek_label = ""
+            self.speed_label = ""
+            self.rated = False
+            self.picked = (15, 10)
+            self.sending = False
+            self.challenge = None
+            self.end_note = ""
+            self.leave_armed = False
+            self.confirm_action = None
+            self.connected_game = False
+            self.state_revision = 0
+            self.bootstrap_delay = 5
+            self.set_decorated(False)
+            self.maximize()
+
+            css = Gtk.CssProvider()
+            css.load_from_data(
+                b"""
+                window, box { background: #ffffff; }
+                #status {
+                    font-family: "Noto Sans", "DejaVu Sans", sans-serif;
+                    font-size: 40px;
+                    font-weight: bold;
+                    color: #000000;
+                }
+                #sub {
+                    font-family: "Noto Sans", "DejaVu Sans", sans-serif;
+                    font-size: 28px;
+                    color: #222222;
+                }
+                entry {
+                    font-family: "Noto Sans", "DejaVu Sans", sans-serif;
+                    font-size: 28px;
+                    color: #000000;
+                    background: #ffffff;
+                    padding: 8px;
+                }
+                button {
+                    font-family: "Noto Sans", "DejaVu Sans", sans-serif;
+                    font-size: 32px;
+                    background: #ffffff;
+                    color: #000000;
+                    border: 4px solid #000000;
+                    border-radius: 8px;
+                    padding: 12px;
+                }
+                button:active { background: #000000; color: #ffffff; }
+                button { min-height: 60px; }
+                """
+            )
+            Gtk.StyleContext.add_provider_for_screen(
+                self.get_screen(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            outer.set_margin_top(28)
+            outer.set_margin_bottom(24)
+            outer.set_margin_start(24)
+            outer.set_margin_end(24)
+            self.add(outer)
+            self.status = Gtk.Label()
+            self.status.set_name("status")
+            self.status.set_xalign(0)
+            self.status.set_line_wrap(True)
+            self.status.set_max_width_chars(36)
+            self.sub = Gtk.Label()
+            self.sub.set_name("sub")
+            self.sub.set_xalign(0)
+            self.sub.set_line_wrap(True)
+            self.sub.set_max_width_chars(36)
+            outer.pack_start(self.status, False, False, 0)
+            outer.pack_start(self.sub, False, False, 0)
+            self.board = Board(self)
+            outer.pack_start(self.board, True, True, 0)
+
+            self.promo_row = Gtk.Box(spacing=12)
+            for label, promo in (("Queen", "Q"), ("Rook", "R"), ("Bishop", "B"), ("Knight", "N")):
+                button = Gtk.Button(label=label)
+                button.connect("clicked", self._choose_promo, promo)
+                self.promo_row.pack_start(button, True, True, 0)
+            outer.pack_start(self.promo_row, False, False, 0)
+
+            self.local_row = Gtk.Box(spacing=12)
+            for label, handler in (
+                ("New", self._new),
+                ("Undo", self._undo),
+                ("Close", self._close),
+            ):
+                button = Gtk.Button(label=label)
+                button.connect("clicked", handler)
+                self.local_row.pack_start(button, True, True, 0)
+            outer.pack_start(self.local_row, False, False, 0)
+            self.mode_row = Gtk.Box(spacing=12)
+            self.mode_buttons = {}
+            for label, mode in (("Play white", "w"), ("Play black", "b"), ("Two players", "both")):
+                button = Gtk.Button(label=label)
+                button.connect("clicked", self._set_mode, mode)
+                self.mode_buttons[mode] = button
+                self.mode_row.pack_start(button, True, True, 0)
+            outer.pack_start(self.mode_row, False, False, 0)
+            self.lichess_button = Gtk.Button(label="Lichess")
+            self.lichess_button.connect("clicked", self._open_lichess)
+            outer.pack_start(self.lichess_button, False, False, 0)
+
+            self.live_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            self.token_row = Gtk.Box(spacing=12)
+            self.token_entry = Gtk.Entry()
+            self.token_entry.set_visibility(False)
+            self.token_entry.set_placeholder_text("Token")
+            self.token_entry.set_hexpand(True)
+            save_token_button = Gtk.Button(label="Save token")
+            save_token_button.connect("clicked", self._save_token_clicked)
+            self.token_row.pack_start(self.token_entry, True, True, 0)
+            self.token_row.pack_start(save_token_button, False, False, 0)
+            self.connect_button = Gtk.Button(label="Account")
+            self.connect_button.connect("clicked", self._login_help)
+            self.challenge_row = Gtk.Box(spacing=12)
+            accept = Gtk.Button(label="Accept")
+            decline = Gtk.Button(label="Decline")
+            accept.connect("clicked", self._accept_challenge)
+            decline.connect("clicked", self._decline_challenge)
+            self.challenge_row.pack_start(accept, True, True, 0)
+            self.challenge_row.pack_start(decline, True, True, 0)
+            self.tc_row = Gtk.Box(spacing=12)
+            for label, minutes, increment in (("15+10", 15, 10), ("10+5", 10, 5), ("30+0", 30, 0)):
+                button = Gtk.Button(label=label)
+                button.connect("clicked", self._seek_clicked, minutes, increment)
+                self.tc_row.pack_start(button, True, True, 0)
+            self.friend_row = Gtk.Box(spacing=12)
+            self.friend_entry = Gtk.Entry()
+            self.friend_entry.set_placeholder_text("Username")
+            self.friend_entry.set_hexpand(True)
+            challenge_button = Gtk.Button(label="Challenge")
+            challenge_button.connect("clicked", self._challenge_friend)
+            self.friend_row.pack_start(self.friend_entry, True, True, 0)
+            self.friend_row.pack_start(challenge_button, False, False, 0)
+            self.rated_button = Gtk.Button(label="Casual")
+            self.rated_button.connect("clicked", self._toggle_rated)
+            self.action_row = Gtk.Box(spacing=12)
+            self.draw_button = Gtk.Button(label="Offer draw")
+            self.resign_button = Gtk.Button(label="Resign")
+            self.abort_button = Gtk.Button(label="Abort")
+            self.claim_button = Gtk.Button(label="Claim win")
+            self.cancel_button = Gtk.Button(label="Cancel")
+            self.draw_button.connect("clicked", lambda _b: self._post_game("draw/yes"))
+            self.resign_button.connect("clicked", lambda _b: self._confirm_game("resign"))
+            self.abort_button.connect("clicked", lambda _b: self._confirm_game("abort"))
+            self.claim_button.connect("clicked", lambda _b: self._post_game("claim-victory"))
+            self.cancel_button.connect("clicked", self._cancel_seek)
+            for button in (
+                self.draw_button,
+                self.resign_button,
+                self.abort_button,
+                self.claim_button,
+                self.cancel_button,
+            ):
+                self.action_row.pack_start(button, True, True, 0)
+            self.leave_button = Gtk.Button(label="Leave")
+            self.leave_button.connect("clicked", self._leave_lichess)
+            self.reconnect_button = Gtk.Button(label="Reconnect")
+            self.reconnect_button.connect("clicked", lambda _b: self._connect())
+            self.live_footer = Gtk.Box(spacing=12)
+            for button in (self.connect_button, self.reconnect_button, self.leave_button):
+                self.live_footer.pack_start(button, True, True, 0)
+            for child in (
+                self.token_row,
+                self.challenge_row,
+                self.tc_row,
+                self.friend_row,
+                self.rated_button,
+                self.action_row,
+                self.live_footer,
+            ):
+                self.live_box.pack_start(child, False, False, 0)
+            outer.pack_start(self.live_box, False, False, 0)
+            self.connect("key-press-event", self._key)
+            self.connect("destroy", self._shutdown)
+            self.refresh()
+            GLib.idle_add(self._maybe_engine)
+            GLib.timeout_add(5000, self._tick_clock)
+            GLib.timeout_add_seconds(3, self._check_login)
+
+        def human_turn(self):
+            if self.lichess:
+                if not self.connected_game:
+                    return False
+                if self.sending or self.promo is not None:
+                    return False
+                if self.status_name not in ("started", "created"):
+                    return False
+                return self.game.turn == self.my_color
+            if self.mode == "both":
+                return True
+            return (self.mode == "w" and self.game.turn == "w") or (
+                self.mode == "b" and self.game.turn == "b"
+            )
+
+        def refresh(self):
+            if self.lichess:
+                self.status.set_text(self._live_title())
+                self.sub.set_text(self._sub_line())
+                self._sync_live_buttons()
+            else:
+                kind, text = self.game.result()
+                if self.thinking:
+                    text = "Thinking."
+                self.status.set_text(text)
+                if self.mode == "w":
+                    who = "You play white. The Kindle plays black."
+                elif self.mode == "b":
+                    who = "You play black. The Kindle plays white."
+                else:
+                    who = "Two players. Pass the Kindle each move."
+                self.sub.set_text(who)
+            self.promo_row.set_visible(self.promo is not None)
+            self.board.queue_draw()
+
+        def on_square(self, sq):
+            if sq is None or self.thinking or self.promo is not None:
+                return
+            if not self.lichess:
+                kind, _text = self.game.result()
+                if kind in ("mate", "draw"):
+                    return
+            if not self.human_turn():
+                return
+            if sq in self.targets:
+                move = self.targets[sq]
+                if move[2] == "PROMO":
+                    self.promo = (move[0], move[1], move[3])
+                    self.refresh()
+                    return
+                self._play(move)
+                return
+            piece = self.game.board[sq]
+            if piece == "." or piece.isupper() != (self.game.turn == "w"):
+                self.selected = None
+                self.targets = {}
+                self.refresh()
+                return
+            self.selected = sq
+            self.targets = {}
+            for move in self.game.legal_moves():
+                if move[0] != sq:
+                    continue
+                if move[2] and move[2] != "Q":
+                    continue
+                shown = (move[0], move[1], "PROMO" if move[2] else "", move[3])
+                self.targets[move[1]] = shown
+            self.refresh()
+
+        def _choose_promo(self, _button, promo):
+            if not self.promo:
+                return
+            frm, to, kind = self.promo
+            self.promo = None
+            self._play((frm, to, promo, kind))
+
+        def _play(self, move):
+            if self.lichess:
+                self._play_live(move)
+                return
+            self.game.make(move)
+            self.last_from, self.last_to = move[0], move[1]
+            self.selected = None
+            self.targets = {}
+            save_game(self.game, self.mode)
+            self.refresh()
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            self._maybe_engine()
+
+        def _maybe_engine(self):
+            if self.lichess or self.closing:
+                return False
+            kind, _text = self.game.result()
+            if kind in ("mate", "draw") or self.human_turn() or self.thinking:
+                return False
+            self.thinking = True
+            self.refresh()
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            move = choose_move(self.game)
+            self.thinking = False
+            if move:
+                self.game.make(move)
+                self.last_from, self.last_to = move[0], move[1]
+                save_game(self.game, self.mode)
+            self.refresh()
+            return False
+
+        def _new(self, _button):
+            if self.lichess:
+                return
+            self.game = Game()
+            self.selected = None
+            self.targets = {}
+            self.promo = None
+            self.last_from = None
+            self.last_to = None
+            self.thinking = False
+            save_game(self.game, self.mode)
+            self.refresh()
+            GLib.idle_add(self._maybe_engine)
+
+        def _undo(self, _button):
+            if self.lichess or self.thinking or self.promo is not None:
+                return
+            steps = 1 if self.mode == "both" else 2
+            if self.mode != "both" and not self.human_turn() and self.game.stack:
+                steps = 1
+            for _ in range(steps):
+                if not self.game.stack:
+                    break
+                self.game.unmake()
+            self.selected = None
+            self.targets = {}
+            self.last_from = None
+            self.last_to = None
+            save_game(self.game, self.mode)
+            self.refresh()
+
+        def _set_mode(self, _button, mode):
+            if self.lichess:
+                return
+            self.mode = mode
+            self._new(None)
+
+        def _close(self, _button):
+            self.destroy()
+
+        def _shutdown(self, *_args):
+            self.closing = True
+            self.session += 1
+            client = self.client
+            self.client = None
+            if client is not None:
+                client.close()
+
+        def _key(self, _widget, event):
+            if isinstance(self.get_focus(), Gtk.Entry):
+                return False
+            name = Gdk.keyval_name(event.keyval) or ""
+            if name in ("q", "Q", "Escape"):
+                self.destroy()
+            elif name in ("u", "U") and not self.lichess:
+                self._undo(None)
+            elif name in ("n", "N") and not self.lichess:
+                self._new(None)
+            return False
+
+        def _tick_clock(self):
+            # The clock is one label. The board is not redrawn here.
+            if (
+                self.lichess
+                and self.game_id
+                and self.status_name == "started"
+                and not self.sending
+            ):
+                self.sub.set_text(self._sub_line())
+            elif self.lichess and self.client is not None and self.client.cooldown > time.monotonic():
+                self.sub.set_text(self._sub_line())
+            if not self.closing:
+                GLib.timeout_add(self._clock_delay(), self._tick_clock)
+            return False
+
+        def _clock_delay(self):
+            if not self.lichess or self.status_name != "started":
+                return 5000
+            mine = self._remaining(self.my_color)
+            if mine is None:
+                return 5000
+            if mine < 20000:
+                return 1000
+            if mine < 120000:
+                return 5000
+            return 30000
+
+        def _remaining(self, color):
+            base = self.wtime if color == "w" else self.btime
+            if base is None:
+                return None
+            if self.status_name == "started" and self.game.turn == color:
+                spent = int((time.monotonic() - self.clock_mark) * 1000)
+                return max(0, int(base) - spent)
+            return int(base)
+
+        def _clock_line(self):
+            mine = self._remaining(self.my_color)
+            other = "b" if self.my_color == "w" else "w"
+            theirs = self._remaining(other)
+            if mine is None or theirs is None:
+                return ""
+            return "You %s    %s %s" % (format_ms(mine), self.opponent or "Them", format_ms(theirs))
+
+        def _end_note(self):
+            labels = {
+                "mate": "Checkmate.",
+                "resign": "Resignation.",
+                "timeout": "Time.",
+                "outoftime": "Time.",
+                "draw": "Draw.",
+                "stalemate": "Stalemate.",
+                "aborted": "Aborted.",
+                "noStart": "The game did not start.",
+                "insufficientMaterialClaim": "Draw.",
+            }
+            text = labels.get(self.status_name, "")
+            if not text:
+                if self.status_name not in ("started", "created", ""):
+                    text = "The game ended."
+                else:
+                    return ""
+            if self.winner == "white":
+                who = "You won." if self.my_color == "w" else "You lost."
+            elif self.winner == "black":
+                who = "You won." if self.my_color == "b" else "You lost."
+            else:
+                who = ""
+            return " ".join(part for part in (who, text) if part)
+
+        def _live_title(self):
+            if self.asking_token:
+                return "Lichess"
+            if self.sending:
+                return "Sending."
+            if self.game_id and self.status_name in ("started", "created"):
+                if self.game.turn == self.my_color:
+                    return "Your move."
+                return "Waiting for %s." % (self.opponent or "opponent")
+            if self.game_id and self.end_note:
+                return self.end_note
+            if self.seeking:
+                return "Waiting for an opponent."
+            if self.username:
+                return "Signed in as %s." % self.username
+            return "Lichess"
+
+        def _sub_line(self):
+            playing = self.game_id and self.status_name in ("started", "created")
+            if self.asking_token:
+                return TOKEN_HELP
+            if self.client is not None and self.client.cooldown > time.monotonic():
+                remaining = max(1, int(self.client.cooldown - time.monotonic()) + 1)
+                return 'Lichess cooldown: retrying automatically in %ds. Leave this screen open.' % remaining
+            if playing:
+                if not self.connected_game:
+                    return "Connection interrupted. Reconnecting; moves wait for the server."
+                parts = [self._clock_line(), self.speed_label, self.gone_note]
+                if self.their_draw:
+                    parts.append("They offer a draw.")
+                return "  ".join(part for part in parts if part)
+            if self.challenge is not None:
+                return challenge_summary(self.challenge)
+            if self.seeking:
+                return "%s. Tap Cancel to stop." % self.seek_label
+            if self.game_id and self.end_note:
+                return "Tap a time to play again."
+            if self.username:
+                return "Tap a time to find an opponent. Casual leaves your rating alone."
+            return ""
+
+        def _sync_live_buttons(self):
+            if not self.lichess:
+                return
+            playing = bool(self.game_id) and self.status_name in ("started", "created")
+            idle = not self.asking_token and not playing and bool(self.username) and not self.seeking
+            self.board.set_visible(bool(self.game_id))
+            self.connect_button.set_visible(not playing and not self.seeking)
+            self.reconnect_button.set_visible(not self.asking_token and not self.seeking)
+            self.token_row.set_visible(self.asking_token)
+            self.challenge_row.set_visible(
+                self.challenge is not None and not playing and not self.asking_token
+            )
+            self.tc_row.set_visible(idle)
+            self.friend_row.set_visible(idle)
+            self.rated_button.set_visible(idle)
+            self.action_row.set_visible(playing or self.seeking)
+            self.draw_button.set_visible(playing)
+            self.draw_button.set_label("Accept draw" if self.their_draw else "Offer draw")
+            self.resign_button.set_visible(playing)
+            plies = len((self.server_moves or "").split())
+            self.abort_button.set_visible(playing and plies < 2)
+            self.claim_button.set_visible(playing and self.can_claim)
+            self.cancel_button.set_visible(self.seeking and not playing)
+            self.leave_button.set_visible(True)
+            self.leave_button.set_label("Leave game" if playing else "Local chess")
+
+        def _login_help(self, _button):
+            self.sub.set_text(TOKEN_HELP)
+            subprocess.Popen(["deck-web", "lichess"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def _check_login(self):
+            if self.closing:
+                return False
+            if self.lichess and self.asking_token:
+                token = load_token()
+                if token and token != self.token:
+                    self.token = token
+                    self.asking_token = False
+                    self._connect()
+            return True
+
+        def _confirm_game(self, action):
+            if self.confirm_action == action:
+                self.confirm_action = None
+                self._post_game(action)
+            else:
+                self.confirm_action = action
+                self.sub.set_text("Tap %s again to confirm." % action.title())
+                GLib.timeout_add_seconds(8, self._clear_confirmation)
+
+        def _clear_confirmation(self):
+            self.confirm_action = None
+            return False
+
+        def _open_lichess(self, _button):
+            if self.lichess:
+                return
+            self.lichess = True
+            self.thinking = False
+            self.sending = False
+            self.selected = None
+            self.targets = {}
+            self.promo = None
+            self.local_row.hide()
+            self.mode_row.hide()
+            self.lichess_button.hide()
+            self.live_box.show()
+            self.token = load_token()
+            if not self.token:
+                self.asking_token = True
+                self.status.set_text("Lichess")
+                self.sub.set_text(TOKEN_HELP)
+                self._sync_live_buttons()
+                return
+            self.asking_token = False
+            self._sync_live_buttons()
+            self._connect()
+
+        def _connect(self):
+            self.session += 1
+            session = self.session
+            old = self.client
+            self.client = LichessClient(self.token)
+            if old is not None:
+                old.close()
+            self.game_id = ""
+            self.username = ""
+            self.connected_game = False
+            self.seeking = False
+            self.seek_gen += 1
+            self.challenge = None
+            self.status_name = ""
+            self.server_moves = ""
+            self.wtime = None
+            self.btime = None
+            self.their_draw = False
+            self.can_claim = False
+            self.gone_note = ""
+            self.end_note = ""
+            self.game = Game()
+            self.mode = "w"
+            self.my_color = "w"
+            self.last_from = None
+            self.last_to = None
+            self.status.set_text("Reaching Lichess.")
+            self.sub.set_text("The Kindle needs Wi-Fi.")
+            self.board.queue_draw()
+            self._sync_live_buttons()
+            threading.Thread(target=self._bootstrap, args=(session,), daemon=True).start()
+
+        def _bootstrap(self, session):
+            client = self.client
+            if client is None:
+                return
+            status, body = client.call("GET", "/api/account")
+            playing = None
+            if status == 200:
+                pstatus, pbody = client.call("GET", "/api/account/playing")
+                if pstatus == 200:
+                    try:
+                        playing = first_standard_game(pbody)
+                    except ValueError:
+                        playing = None
+
+            def ready():
+                if session != self.session:
+                    return False
+                if status != 200:
+                    self.asking_token = status in (401, 403)
+                    self.status.set_text("Lichess")
+                    self.sub.set_text(lichess_failure(status, body, self.token))
+                    self._sync_live_buttons()
+                    if not self.asking_token:
+                        delay = max(self.bootstrap_delay, int(client.cooldown - time.monotonic()) + 1)
+                        self.bootstrap_delay = min(60, self.bootstrap_delay * 2)
+                        GLib.timeout_add_seconds(delay, self._retry_account, session)
+                    return False
+                try:
+                    self.username = account_name(body)
+                except ValueError:
+                    self.username = ""
+                self.asking_token = False
+                self.bootstrap_delay = 5
+                print('Lichess account connected: ' + self.username, flush=True)
+                self.refresh()
+                threading.Thread(target=self._event_loop, args=(session,), daemon=True).start()
+                if playing:
+                    self._start_game(
+                        {
+                            "gameId": playing.get("gameId"),
+                            "color": playing.get("color"),
+                            "opponent": playing.get("opponent") or {},
+                            "variant": playing.get("variant") or {"key": "standard"},
+                            "compat": playing.get("compat") or {},
+                        }
+                    )
+                return False
+
+            GLib.idle_add(ready)
+
+        def _retry_account(self, session):
+            if session == self.session and self.lichess and not self.closing:
+                threading.Thread(target=self._bootstrap, args=(session,), daemon=True).start()
+            return False
+
+        def _event_loop(self, session):
+            backoff = 2
+            while session == self.session and not self.closing:
+                client = self.client
+                if client is None:
+                    return
+                opened = time.monotonic()
+                for item in client.iter_stream("GET", "/api/stream/event", role="event"):
+                    if session != self.session or self.closing:
+                        return
+                    if item[0] == "timeout":
+                        break
+                    if item[0] == "error":
+                        if item[1] in (401, 403):
+                            GLib.idle_add(self._fail_idle, item[1], item[2], session)
+                            return
+                        if item[1]:
+                            GLib.idle_add(self._fail_idle, item[1], item[2], session)
+                        if item[1] == 429:
+                            time.sleep(60)
+                        break
+                    if item[0] == "event":
+                        GLib.idle_add(self._event_idle, item[2], session)
+                if session != self.session or self.closing:
+                    return
+                time.sleep(max(backoff, client.cooldown - time.monotonic()))
+                backoff = 2 if time.monotonic() - opened > 90 else min(60, backoff * 2)
+
+        def _fail_idle(self, status, body, session):
+            if session != self.session:
+                return False
+            if self.game_id and status not in (401, 404):
+                return False
+            if status == 0 and self.seeking:
+                return False
+            self.sub.set_text(lichess_failure(status, body, self.token))
+            return False
+
+        def _event_idle(self, event, session):
+            if session != self.session or not isinstance(event, dict):
+                return False
+            self._on_event(event)
+            return False
+
+        def _on_event(self, event):
+            kind = event.get("type")
+            if kind == "challenge":
+                challenge = event.get("challenge") or {}
+                variant = (challenge.get("variant") or {}).get("key", "standard")
+                if variant != "standard":
+                    self._decline_id(challenge.get("id"))
+                    return
+                dest = person_name(challenge.get("destUser")).lower()
+                me = (self.username or "").lower()
+                if me and dest and dest != me:
+                    return
+                self.challenge = challenge
+                playing = self.game_id and self.status_name in ("started", "created")
+                if not playing:
+                    self.refresh()
+            elif kind in ("challengeCanceled", "challengeDeclined"):
+                cid = (event.get("challenge") or {}).get("id")
+                if self.challenge and self.challenge.get("id") == cid:
+                    self.challenge = None
+                    self.refresh()
+            elif kind == "gameStart":
+                self._start_game(event.get("game") or {})
+            elif kind == "gameFinish":
+                game = event.get("game") or {}
+                gid = game.get("gameId") or game.get("id")
+                if gid and gid == self.game_id and self.status_name in ("started", "created"):
+                    self.status_name = "unknownFinish"
+                    self.end_note = "The game ended."
+                    self.seeking = False
+                    self.refresh()
+
+        def _start_game(self, game):
+            gid = str(game.get("gameId") or game.get("id") or "")
+            if not game_id_ok(gid):
+                return
+            variant = game.get("variant") or {}
+            key = variant.get("key") if isinstance(variant, dict) else "standard"
+            if key not in (None, "standard"):
+                self.sub.set_text("That game is not standard chess.")
+                return
+            compat = game.get("compat") or {}
+            if compat.get("board") is False:
+                self.sub.set_text("Lichess will not play this one from the board.")
+                return
+            if self.game_id == gid:
+                return
+            if self.client is not None:
+                self.client.close_role("seek")
+                self.client.close_role("challenge")
+            self.seek_gen += 1
+            self.seeking = False
+            self.game_id = gid
+            self.connected_game = False
+            subprocess.Popen(["kindle-keyboard", "hide"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.leave_armed = False
+            color = game.get("color")
+            if color == "white":
+                self.my_color = "w"
+            elif color == "black":
+                self.my_color = "b"
+            self.mode = self.my_color
+            opponent = person_name(game.get("opponent"))
+            if opponent:
+                self.opponent = opponent
+            self.status_name = "started"
+            self.server_moves = ""
+            self.initial_fen = "startpos"
+            self.their_draw = False
+            self.can_claim = False
+            self.gone_note = ""
+            self.end_note = ""
+            self.challenge = None
+            self.game = Game()
+            self.last_from = None
+            self.last_to = None
+            self.refresh()
+            threading.Thread(
+                target=self._game_loop, args=(self.session, gid), daemon=True
+            ).start()
+
+        def _game_loop(self, session, game_id):
+            backoff = 2
+            while session == self.session and self.game_id == game_id and not self.closing:
+                client = self.client
+                if client is None:
+                    return
+                ended = False
+                opened = time.monotonic()
+                for item in client.iter_stream(
+                    "GET", "/api/board/game/stream/" + game_id, role="game"
+                ):
+                    if session != self.session or self.game_id != game_id or self.closing:
+                        return
+                    if item[0] == "timeout":
+                        break
+                    if item[0] == "error":
+                        GLib.idle_add(self._fail_idle, item[1], item[2], session)
+                        if item[1] in (401, 404):
+                            return
+                        break
+                    if item[0] == "event":
+                        payload = item[2]
+                        state = payload.get("state", {}) if payload.get("type") == "gameFull" else payload
+                        if payload.get("type") in ("gameState", "gameFull") and state.get("status") not in (
+                            "started",
+                            "created",
+                            None,
+                        ):
+                            ended = True
+                        GLib.idle_add(self._game_idle, game_id, payload, session)
+                if ended or session != self.session or self.closing or self.game_id != game_id:
+                    return
+                GLib.idle_add(self._disconnected, game_id, session)
+                time.sleep(max(backoff, client.cooldown - time.monotonic()))
+                backoff = 2 if time.monotonic() - opened > 90 else min(60, backoff * 2)
+
+        def _disconnected(self, game_id, session):
+            if session == self.session and game_id == self.game_id:
+                self.connected_game = False
+                self.refresh()
+            return False
+
+        def _game_idle(self, game_id, event, session):
+            if session != self.session or self.game_id != game_id or not isinstance(event, dict):
+                return False
+            self._on_game_event(event)
+            return False
+
+        def _on_game_event(self, event):
+            kind = event.get("type")
+            if kind == "gameFull":
+                variant = (event.get("variant") or {}).get("key", "standard")
+                if variant != "standard":
+                    self.sub.set_text("This is not a standard chess game.")
+                    return
+                self._apply_full(event)
+            elif kind == "gameState":
+                self._take_state(event)
+            elif kind == "opponentGone":
+                if event.get("gone"):
+                    secs = event.get("claimWinInSeconds")
+                    self.can_claim = secs == 0
+                    if isinstance(secs, int) and secs > 0:
+                        self.gone_note = "Opponent left. Claim opens in %s seconds." % secs
+                    elif self.can_claim:
+                        self.gone_note = "Opponent left."
+                else:
+                    self.can_claim = False
+                    self.gone_note = ""
+                self.refresh()
+
+        def _apply_full(self, event):
+            white = person_name(event.get("white"))
+            black = person_name(event.get("black"))
+            if self.username:
+                if white.lower() == self.username.lower():
+                    self.my_color = "w"
+                elif black.lower() == self.username.lower():
+                    self.my_color = "b"
+            self.mode = self.my_color
+            self.opponent = black if self.my_color == "w" else white
+            if not self.opponent:
+                self.opponent = "Opponent"
+            self.initial_fen = event.get("initialFen") or "startpos"
+            rated = "rated" if event.get("rated") else "casual"
+            speed = str(event.get("speed") or "").strip()
+            self.speed_label = ("%s %s" % (speed, rated)).strip()
+            self._take_state(event.get("state") or {})
+
+        def _take_state(self, state):
+            moves = state.get("moves") or ""
+            game = replay_moves(self.initial_fen, moves)
+            if game is None:
+                self.sub.set_text("A move arrived that this board does not understand.")
+                return
+            self.connected_game = True
+            self.state_revision += 1
+            self.confirm_action = None
+            self.server_moves = moves
+            self.game = game
+            parts = moves.split()
+            if parts:
+                self.last_from = parse_sq(parts[-1][0:2])
+                self.last_to = parse_sq(parts[-1][2:4])
+            else:
+                self.last_from = None
+                self.last_to = None
+            if "wtime" in state:
+                self.wtime = state.get("wtime")
+            if "btime" in state:
+                self.btime = state.get("btime")
+            self.clock_mark = time.monotonic()
+            self.status_name = state.get("status") or "started"
+            self.winner = state.get("winner") or ""
+            their_key = "bdraw" if self.my_color == "w" else "wdraw"
+            self.their_draw = bool(state.get(their_key))
+            self.selected = None
+            self.targets = {}
+            self.promo = None
+            self.leave_armed = False
+            self.end_note = self._end_note()
+            self.refresh()
+
+        def _seek_clicked(self, _button, minutes, increment):
+            self._seek(minutes, increment)
+
+        def _seek(self, minutes, increment):
+            if not board_seek_allowed(minutes, increment):
+                self.sub.set_text("Lichess only accepts rapid and classical from this screen.")
+                return
+            if self.client is None or self.asking_token:
+                return
+            self.picked = (minutes, increment)
+            self.seek_gen += 1
+            gen = self.seek_gen
+            self.client.close_role("seek")
+            self.seeking = True
+            self.challenge = None
+            subprocess.Popen(["kindle-keyboard", "hide"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            rated = "rated" if self.rated else "casual"
+            self.seek_label = "%d+%d %s" % (minutes, increment, rated)
+            self.refresh()
+            session = self.session
+            fields = {
+                "rated": "true" if self.rated else "false",
+                "time": str(minutes),
+                "increment": str(increment),
+                "variant": "standard",
+            }
+
+            def run():
+                client = self.client
+                if client is None:
+                    return
+                error = None
+                for item in client.iter_stream("POST", "/api/board/seek", fields, role="seek"):
+                    if session != self.session or gen != self.seek_gen:
+                        return
+                    if item[0] == "error":
+                        error = item
+                        break
+                    if item[0] == "timeout":
+                        break
+
+                def ended():
+                    if session != self.session or gen != self.seek_gen:
+                        return False
+                    self.seeking = False
+                    self.refresh()
+                    if error is not None and not self.game_id:
+                        self.sub.set_text(lichess_failure(error[1], error[2], self.token))
+                    elif not self.game_id:
+                        self.status.set_text("No opponent yet.")
+                        self.sub.set_text("Tap a time to try again.")
+                    return False
+
+                GLib.idle_add(ended)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def _cancel_seek(self, _button):
+            self.seek_gen += 1
+            self.seeking = False
+            if self.client is not None:
+                self.client.close_role("seek")
+                self.client.close_role("challenge")
+            self.refresh()
+
+        def _toggle_rated(self, _button):
+            self.rated = not self.rated
+            self.rated_button.set_label("Rated" if self.rated else "Casual")
+            if self.rated:
+                self.sub.set_text("Rated games change your Lichess rating.")
+            else:
+                self.sub.set_text("Casual leaves your rating alone.")
+
+        def _challenge_friend(self, _button):
+            name = self.friend_entry.get_text().strip()
+            if not username_ok(name):
+                self.sub.set_text("Type a Lichess username. Letters, numbers, a dash, or an underscore.")
+                return
+            if self.client is None or self.asking_token:
+                return
+            minutes, increment = self.picked
+            if not board_seek_allowed(minutes, increment):
+                minutes, increment = 15, 10
+            self.seek_gen += 1
+            gen = self.seek_gen
+            self.client.close_role("challenge")
+            self.seeking = True
+            rated = "rated" if self.rated else "casual"
+            self.seek_label = "Challenge to %s, %d+%d %s" % (name, minutes, increment, rated)
+            self.refresh()
+            fields = {
+                "rated": "true" if self.rated else "false",
+                "clock.limit": str(minutes * 60),
+                "clock.increment": str(increment),
+                "color": "random",
+                "variant": "standard",
+                "keepAliveStream": "true",
+            }
+            path = "/api/challenge/" + urllib.parse.quote(name)
+            session = self.session
+
+            def run():
+                client = self.client
+                if client is None:
+                    return
+                error = None
+                for item in client.iter_stream("POST", path, fields, role="challenge"):
+                    if session != self.session or gen != self.seek_gen:
+                        return
+                    if item[0] == "event" and isinstance(item[2], dict) and item[2].get("done"):
+                        break
+                    if item[0] in ("error", "timeout"):
+                        error = item
+                        break
+
+                def ended():
+                    if session != self.session or gen != self.seek_gen:
+                        return False
+                    self.seeking = False
+                    self.refresh()
+                    if error is not None and not self.game_id:
+                        self.sub.set_text(lichess_failure(error[1], error[2], self.token))
+                    return False
+
+                GLib.idle_add(ended)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def _accept_challenge(self, _button):
+            challenge = self.challenge
+            if not challenge:
+                return
+            cid = str(challenge.get("id") or "")
+            if not game_id_ok(cid):
+                return
+            self.challenge = None
+            self.refresh()
+            self.sub.set_text("Accepting.")
+            self._post_raw("POST", "/api/challenge/%s/accept" % cid, None)
+
+        def _decline_challenge(self, _button):
+            challenge = self.challenge
+            if not challenge:
+                return
+            self.challenge = None
+            self.refresh()
+            self._decline_id(challenge.get("id"))
+
+        def _decline_id(self, cid):
+            cid = str(cid or "")
+            if not game_id_ok(cid) or self.client is None:
+                return
+            self._post_raw("POST", "/api/challenge/%s/decline" % cid, {"reason": "generic"})
+
+        def _post_game(self, suffix):
+            path = game_api_path(self.game_id, suffix)
+            if path is None:
+                return
+            self._post_raw("POST", path, None)
+
+        def _post_raw(self, method, path, fields):
+            client = self.client
+            if client is None:
+                return
+            session = self.session
+
+            def run():
+                status, body = client.call(method, path, fields)
+
+                def done():
+                    if session != self.session:
+                        return False
+                    if status != 200:
+                        self.sub.set_text(lichess_failure(status, body, self.token))
+                    return False
+
+                GLib.idle_add(done)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def _play_live(self, move):
+            # Lichess forbids engine help on this API. This sends the tap only.
+            path = game_api_path(self.game_id, "move/" + uci_of(move))
+            if path is None or self.client is None or self.sending:
+                return
+            self.sending = True
+            self.selected = None
+            self.targets = {}
+            self.promo = None
+            self.game.make(move)
+            self.last_from, self.last_to = move[0], move[1]
+            self.refresh()
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            session = self.session
+            gid = self.game_id
+            client = self.client
+            revision = self.state_revision
+
+            def run():
+                status, body = client.call("POST", path)
+
+                def done():
+                    if session != self.session or self.game_id != gid:
+                        return False
+                    self.sending = False
+                    if status != 200:
+                        if self.state_revision == revision:
+                            self._restore_server()
+                            self.connected_game = False
+                    self.refresh()
+                    if status != 200:
+                        self.sub.set_text(lichess_failure(status, body, self.token))
+                    return False
+
+                GLib.idle_add(done)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def _restore_server(self):
+            game = replay_moves(self.initial_fen, self.server_moves)
+            if game is None:
+                return
+            self.game = game
+            parts = (self.server_moves or "").split()
+            if parts:
+                self.last_from = parse_sq(parts[-1][0:2])
+                self.last_to = parse_sq(parts[-1][2:4])
+            else:
+                self.last_from = None
+                self.last_to = None
+
+        def _save_token_clicked(self, _button):
+            text = self.token_entry.get_text().strip()
+            if not token_ok(text):
+                self.sub.set_text("That token does not look right. Use the long line from Lichess, with no spaces.")
+                return
+            try:
+                save_token(text)
+            except OSError:
+                self.sub.set_text("Could not save the token on the Kindle.")
+                return
+            self.token_entry.set_text("")
+            self.token = text
+            self.asking_token = False
+            self._connect()
+
+        def _leave_lichess(self, _button):
+            playing = self.game_id and self.status_name in ("started", "created")
+            if playing and not self.leave_armed:
+                self.leave_armed = True
+                self.sub.set_text("Tap Leave again. This does not resign, and the clock keeps running.")
+                return
+            self.leave_armed = False
+            self.lichess = False
+            self.session += 1
+            self.seeking = False
+            self.game_id = ""
+            self.asking_token = False
+            self.challenge = None
+            client = self.client
+            self.client = None
+            if client is not None:
+                client.close()
+            loaded = load_saved()
+            if loaded:
+                self.game, self.mode = loaded
+            else:
+                self.game = Game()
+                self.mode = "w"
+            self.selected = None
+            self.targets = {}
+            self.promo = None
+            self.sending = False
+            self.last_from = None
+            self.last_to = None
+            self.live_box.hide()
+            self.board.show()
+            self.local_row.show()
+            self.mode_row.show()
+            self.lichess_button.show()
+            self.refresh()
+
+    application = Gtk.Application(application_id=APPLICATION_ID)
+    application.register(None)
+    if application.get_is_remote():
+        application.activate_action("online" if "--lichess" in sys.argv else "show", None)
+        return 0
+    win = Chess()
+    application.add_window(win)
+    def show_board(_action=None, _parameter=None):
+        win.present()
+    def show_online(_action=None, _parameter=None):
+        win._open_lichess(None)
+        win.present()
+    for name, callback in (("show", show_board), ("online", show_online)):
+        action = Gio.SimpleAction.new(name, None)
+        action.connect("activate", callback)
+        application.add_action(action)
+    application.connect("activate", lambda _app: show_board())
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    win.promo_row.hide()
+    win.live_box.hide()
+    if "--lichess" in sys.argv:
+        win._open_lichess(None)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

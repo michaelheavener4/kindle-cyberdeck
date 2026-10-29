@@ -1,0 +1,21 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+mode=${1:-menu}
+if [ "$mode" = menu ]; then
+  printf '\nDISPLAY\n\n1  Portrait\n2  Landscape - left\n3  Landscape - right\n0  Back\n\nChoice: '
+  read -r choice
+  case "$choice" in 1) mode=portrait ;; 2) mode=left ;; 3) mode=right ;; *) exit 0 ;; esac
+fi
+case "$mode" in portrait|normal) rotation=normal; mode=portrait ;; landscape|left) rotation=left; mode=left ;; right) rotation=right ;; *) exit 2 ;; esac
+xrandr -o "$rotation" 2>/tmp/kindle-orientation.log || { cat /tmp/kindle-orientation.log >&2; exit 1; }
+# Recompute six equal desktop-panel cells for the new screen width.
+jwm -restart >/dev/null 2>&1 || true
+# Onboard otherwise retains the previous orientation's reserved-space strut.
+if xdotool search --onlyvisible --name '^Onboard$' >/dev/null 2>&1; then
+  kindle-keyboard hide >/dev/null 2>&1
+  sleep 1
+  kindle-keyboard show >/dev/null 2>&1
+fi
+mkdir -p /mnt/kindle/linux
+printf '%s\n' "$mode" >/mnt/kindle/linux/orientation
+echo "Display: $mode"

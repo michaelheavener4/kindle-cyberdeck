@@ -1,0 +1,117 @@
+#!/usr/bin/python3
+"""Let JWM resize main windows with the docked keyboard's work area."""
+import ctypes as C
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+
+class Data(C.Union):
+    _fields_ = [('b', C.c_char * 20), ('s', C.c_short * 10), ('l', C.c_long * 5)]
+
+
+class Client(C.Structure):
+    _fields_ = [('type', C.c_int), ('serial', C.c_ulong), ('send_event', C.c_int),
+                ('display', C.c_void_p), ('window', C.c_ulong), ('message_type', C.c_ulong),
+                ('format', C.c_int), ('data', Data)]
+
+
+class Event(C.Union):
+    _fields_ = [('xclient', Client), ('pad', C.c_long * 24)]
+
+
+class Desktop:
+    def __init__(self):
+        self.x = x = C.CDLL('libX11.so.6')
+        x.XOpenDisplay.argtypes = [C.c_char_p]; x.XOpenDisplay.restype = C.c_void_p
+        x.XDefaultRootWindow.argtypes = [C.c_void_p]; x.XDefaultRootWindow.restype = C.c_ulong
+        x.XInternAtom.argtypes = [C.c_void_p, C.c_char_p, C.c_int]; x.XInternAtom.restype = C.c_ulong
+        x.XGetWindowProperty.argtypes = [C.c_void_p,C.c_ulong,C.c_ulong,C.c_long,C.c_long,C.c_int,C.c_ulong,
+            C.POINTER(C.c_ulong),C.POINTER(C.c_int),C.POINTER(C.c_ulong),C.POINTER(C.c_ulong),C.POINTER(C.POINTER(C.c_ubyte))]
+        x.XSendEvent.argtypes = [C.c_void_p,C.c_ulong,C.c_int,C.c_long,C.POINTER(Event)]
+        x.XFlush.argtypes = [C.c_void_p]; x.XFree.argtypes = [C.c_void_p]
+        self.error_handler = C.CFUNCTYPE(C.c_int,C.c_void_p,C.c_void_p)(lambda *_: 0)
+        x.XSetErrorHandler(self.error_handler)
+        self.display = x.XOpenDisplay(os.environ.get('DISPLAY',':1').encode())
+        if not self.display: raise RuntimeError('No Linux display')
+        self.root = x.XDefaultRootWindow(self.display)
+        self.atoms = {}
+
+    def atom(self, name):
+        if name not in self.atoms:
+            self.atoms[name] = self.x.XInternAtom(self.display,name.encode(),0)
+        return self.atoms[name]
+
+    def prop(self, window, name):
+        typ=C.c_ulong();fmt=C.c_int();count=C.c_ulong();after=C.c_ulong();data=C.POINTER(C.c_ubyte)()
+        self.x.XGetWindowProperty(self.display,window,self.atom(name),0,4096,0,0,
+            C.byref(typ),C.byref(fmt),C.byref(count),C.byref(after),C.byref(data))
+        try:
+            if not data: return []
+            if fmt.value == 32:
+                return list(C.cast(data,C.POINTER(C.c_ulong))[:count.value])
+            return C.string_at(data,count.value)
+        finally:
+            if data: self.x.XFree(data)
+
+    def fit(self, window, refresh=False):
+        classes=self.prop(window,'WM_CLASS')
+        if isinstance(classes,bytes) and any(s in classes.lower() for s in [b'onboard',b'kindle-mgba',b'gb-pad']): return
+        types=self.prop(window,'_NET_WM_WINDOW_TYPE')
+        if types and self.atom('_NET_WM_WINDOW_TYPE_NORMAL') not in types: return
+        states=self.prop(window,'_NET_WM_STATE')
+        maximized=self.atom('_NET_WM_STATE_MAXIMIZED_VERT') in states
+        if maximized and not refresh: return
+        e=Event();e.xclient.type=33;e.xclient.display=self.display;e.xclient.window=window
+        e.xclient.message_type=self.atom('_NET_WM_STATE');e.xclient.format=32
+        if refresh:
+            e.xclient.data.l[:]=[0,self.atom('_NET_WM_STATE_MAXIMIZED_VERT'),self.atom('_NET_WM_STATE_MAXIMIZED_HORZ'),1,0]
+            self.x.XSendEvent(self.display,self.root,0,(1<<19)|(1<<20),C.byref(e))
+        e.xclient.data.l[:]=[1,self.atom('_NET_WM_STATE_MAXIMIZED_VERT'),self.atom('_NET_WM_STATE_MAXIMIZED_HORZ'),1,0]
+        self.x.XSendEvent(self.display,self.root,0,(1<<19)|(1<<20),C.byref(e))
+        self.x.XFlush(self.display)
+
+
+def main():
+    desktop=Desktop()
+    if '--window' in sys.argv:
+        window=int(sys.argv[sys.argv.index('--window')+1],0)
+        states=desktop.prop(window,'_NET_WM_STATE')
+        desktop.fit(window,refresh=desktop.atom('_NET_WM_STATE_MAXIMIZED_VERT') in states)
+        return
+    if '--daemon' not in sys.argv:
+        for window in desktop.prop(desktop.root,'_NET_CLIENT_LIST'): desktop.fit(window)
+        return
+    running=True
+    Path('/tmp/kindle-window-fit.pid').write_text(str(os.getpid()))
+    def stop(*_):
+        nonlocal running
+        running=False
+    signal.signal(signal.SIGTERM,stop)
+    signal.signal(signal.SIGINT,stop)
+    seen=set()
+    workarea=None
+    settle={}
+    while running:
+        windows=set(desktop.prop(desktop.root,'_NET_CLIENT_LIST'))
+        area=desktop.prop(desktop.root,'_NET_WORKAREA')
+        if workarea is not None and area != workarea:
+            for window in windows: desktop.fit(window,refresh=True)
+        for window in windows-seen:
+            desktop.fit(window);settle[window]=time.monotonic()+2
+        for window,deadline in list(settle.items()):
+            if window not in windows: del settle[window]
+            elif time.monotonic()>=deadline:
+                desktop.fit(window);del settle[window]
+        for window in windows & seen:
+            classes=desktop.prop(window,'WM_CLASS')
+            if isinstance(classes,bytes) and any(name in classes.lower() for name in (b'netsurf',b'deck-home')):
+                desktop.fit(window)
+        seen=windows
+        workarea=area
+        time.sleep(0.75)
+
+
+if __name__ == '__main__': main()

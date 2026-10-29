@@ -1,0 +1,20 @@
+#!/bin/sh
+# JWM's Clock component supports an explicit width; static labels give each
+# launcher an equal hit area instead of sizing it to the length of its text.
+export DISPLAY="${DISPLAY:-:1}"
+screen=$(xdpyinfo 2>/dev/null | awk '/dimensions:/{split($2,a,"x");print a[1];exit}')
+case "$screen" in ''|*[!0-9]*) screen=1272 ;; esac
+cell=$(((screen-1)/6))
+printf '<JWM><Tray x="0" y="-1" width="-1" height="112" autohide="off">\n'
+for label in HOME APPS KEYS UP DOWN CLOSE; do
+  case "$label" in
+    HOME) command='/usr/local/bin/deck-home' ;;
+    APPS) command='/usr/local/bin/deck-home windows' ;;
+    KEYS) command='/usr/local/bin/kindle-keyboard toggle' ;;
+    UP) command='/usr/local/bin/kindle-scroll up' ;;
+    DOWN) command='/usr/local/bin/kindle-scroll down' ;;
+    CLOSE) command='/usr/local/bin/kindle-close-window' ;;
+  esac
+  printf '<Clock format="%s" width="%s"><Button mask="123">exec:%s</Button></Clock>\n' "$label" "$cell" "$command"
+done
+printf '</Tray><ClockStyle><Font>Sans-30:bold</Font><Foreground>#000000</Foreground><Background>#ffffff</Background></ClockStyle></JWM>\n'

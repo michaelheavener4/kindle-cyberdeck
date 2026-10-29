@@ -1,0 +1,19 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+. /usr/local/bin/deck-net
+page=${1:-chat}
+case "$page" in home|chat|archive|lichess) ;; *) exit 2 ;; esac
+deck_net_ready || exit 1
+ssh -o BatchMode=yes -o ConnectTimeout=10 omarchy 'export PATH="$HOME/.local/bin:$PATH"; kindle-hub ensure' || exit 1
+if [ ! -f /tmp/kindle-hub-tunnel.pid ] || ! kill -0 "$(cat /tmp/kindle-hub-tunnel.pid)" 2>/dev/null; then
+  nohup ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
+    -L 127.0.0.1:8765:127.0.0.1:8765 omarchy </dev/null >/mnt/kindle/linux/hub-tunnel.log 2>&1 &
+  echo $! >/tmp/kindle-hub-tunnel.pid
+  sleep 1
+fi
+if ! kill -0 "$(cat /tmp/kindle-hub-tunnel.pid)" 2>/dev/null; then
+  echo 'The private browser connection could not start.' >&2
+  cat /mnt/kindle/linux/hub-tunnel.log >&2
+  exit 1
+fi
+exec kindle-browser "http://127.0.0.1:8765/$page"

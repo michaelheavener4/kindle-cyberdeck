@@ -1,0 +1,127 @@
+#!/bin/sh
+
+# JWM is the whole desktop session. Onboard is launched by JWM's StartupCommand
+# so it maps under a running window manager and appears automatically.
+export XDG_CURRENT_DESKTOP=JWM
+export DESKTOP_SESSION=jwm
+export GSETTINGS_BACKEND=keyfile
+export NO_AT_BRIDGE=1
+export ONBOARD_X11_ONLY=1
+unset GTK_MODULES
+
+xset s off 2>/dev/null
+xset -dpms 2>/dev/null
+
+# USB host is unproven on this Paperwhite. Try it for the whole session so a
+# keyboard and a mouse can enumerate. Touch is not grabbed. Leaving Linux
+# puts the port back.
+pointer_pid=
+if [ -x /usr/local/bin/deck-usb-host ]; then
+	deck-usb-host up >/tmp/deck-usb-host.up 2>&1 || true
+fi
+if [ -x /usr/local/bin/deck-pointer ]; then
+	if mkdir -p /mnt/kindle/linux 2>/dev/null; then
+		pointer_log=/mnt/kindle/linux/pointer.log
+	else
+		pointer_log=/tmp/deck-pointer.log
+	fi
+	deck-pointer --install-cursors >>"$pointer_log" 2>&1 || true
+	export XCURSOR_PATH=/tmp/kindle-cursors
+	export XCURSOR_THEME=kindle
+	export XCURSOR_SIZE=64
+	deck-pointer >>"$pointer_log" 2>&1 &
+	pointer_pid=$!
+fi
+
+# Joy-Con keys for this session. The bridge is not started at boot.
+# Page taps stay off while this flag exists, so the reader is not poked
+# through the desktop.
+joy_pid=
+if [ -x /usr/local/bin/deck-joycon ]; then
+	mkdir -p /mnt/kindle/linux 2>/dev/null || true
+	if [ ! -e /mnt/us ] && [ -d /mnt/kindle ]; then
+		ln -s /mnt/kindle /mnt/us 2>/dev/null || true
+	fi
+	: >/mnt/kindle/linux/joycon.alpine 2>/dev/null || true
+	deck-joycon watch >>/mnt/kindle/linux/joycon.log 2>&1 &
+	joy_pid=$!
+fi
+
+# Restore only the nested Linux display; the native Kindle reader stays portrait.
+if [ -r /mnt/kindle/linux/orientation ]; then
+	deck-orientation "$(cat /mnt/kindle/linux/orientation)" >/tmp/kindle-orientation.restore 2>&1 || true
+fi
+fit_pid=
+if [ -x /usr/local/bin/kindle-window-fit ]; then
+	kindle-window-fit --daemon >>/mnt/kindle/linux/window-fit.log 2>&1 &
+	fit_pid=$!
+fi
+if [ -x /usr/local/bin/artgen ] && [ ! -f /mnt/kindle/art/disabled ]; then
+  artgen generate-daily >>/mnt/kindle/linux/art.log 2>&1 &&
+    artgen set-background --latest >>/mnt/kindle/linux/art.log 2>&1 || true
+fi
+
+jwm -f /etc/jwm/system.jwmrc
+status=$?
+
+if [ -n "$fit_pid" ]; then
+	kill "$fit_pid" 2>/dev/null || true
+	wait "$fit_pid" 2>/dev/null || true
+fi
+if [ -f /mnt/kindle/art/desktop.pid ]; then
+  art_pid=$(cat /mnt/kindle/art/desktop.pid)
+  if tr '\000' ' ' </proc/"$art_pid"/cmdline 2>/dev/null | grep -q 'artgen view --desktop'; then
+    kill "$art_pid" 2>/dev/null || true
+  fi
+fi
+xrandr -o normal >/dev/null 2>&1 || true
+if [ -f /tmp/kindle-hub-tunnel.pid ]; then
+	kill "$(cat /tmp/kindle-hub-tunnel.pid)" 2>/dev/null || true
+	rm -f /tmp/kindle-hub-tunnel.pid
+fi
+
+rm -f /mnt/kindle/linux/joycon.alpine 2>/dev/null || true
+if [ -n "$joy_pid" ]; then
+	kill "$joy_pid" 2>/dev/null || true
+	wait "$joy_pid" 2>/dev/null || true
+fi
+# The Joy-Con book keeps the bridge up for page turns. Otherwise put the
+# radio back when Linux closes.
+if [ ! -f /mnt/kindle/linux/joycon.on ] && [ -f /mnt/kindle/linux/joycon-pages.sh ]; then
+	sh /mnt/kindle/linux/joycon-pages.sh stop-daemon >/dev/null 2>&1 || true
+fi
+
+if [ -n "$pointer_pid" ]; then
+	kill "$pointer_pid" 2>/dev/null || true
+	wait "$pointer_pid" 2>/dev/null || true
+fi
+if [ -x /usr/local/bin/deck-usb-host ]; then
+	deck-usb-host down >/tmp/deck-usb-host.down 2>&1 || true
+fi
+
+# The e-ink mirror adds a headless output on the laptop. Remove it before
+# tailscaled is stopped, or that screen stays up after Linux exits.
+if [ -f /tmp/kindle-display.on ]; then
+	remote='bash -lc '\''exec "$HOME/.local/bin/kindle-display" stop'\'''
+	if ssh -T -o BatchMode=yes -o ConnectTimeout=8 omarchy "$remote" \
+		>/tmp/kindle-display.stop 2>&1; then
+		rm -f /tmp/kindle-display.on
+	fi
+fi
+
+# Do not let a keyboard or application keep the chroot mounted after Exit.
+if [ -f /run/cyberdeck-sshd.pid ]; then
+  kill "$(cat /run/cyberdeck-sshd.pid)" 2>/dev/null || true
+  rm -f /run/cyberdeck-sshd.pid
+fi
+pkill -TERM onboard 2>/dev/null
+pkill -TERM tailscaled 2>/dev/null
+for pid_dir in /proc/[0-9]*; do
+	[ -r "$pid_dir/comm" ] || continue
+	case "$(cat "$pid_dir/comm" 2>/dev/null)" in
+	onboard | xterm | netsurf | chromium | tailscaled) kill "${pid_dir#/proc/}" 2>/dev/null || true ;;
+	esac
+done
+
+[ "$status" -eq 0 ] || exit "$status"
+exit 0

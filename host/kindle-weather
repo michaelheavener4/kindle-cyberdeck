@@ -1,0 +1,717 @@
+#!/usr/bin/python3
+"""Draw one forecast for the Kindle sleep screen and copy it over USB.
+
+The sleep screen is a still picture. It does not update while the Kindle
+is asleep, and nothing here sets a wake alarm. Plug the Kindle in and run
+this again when the forecast should change.
+
+The picture is 1272x1696, the framebuffer measured on this Paperwhite 6.
+Custom Screensaver scales with FBInk `w=-1,h=-1`, so a matching size stays
+sharp. Only `screensavers/00-weather.png` is written, so the daemon does
+not rotate away from the forecast.
+
+Location is ~/.config/kindle-cyberdeck/weather.json. The laptop's public
+IP is a datacenter, so this does not guess a city. Pass --place once.
+Forecast data is Open-Meteo, with no API key. Temperatures are Fahrenheit.
+"""
+
+import json
+import math
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from PIL import Image, ImageDraw, ImageFont
+
+W = 1272
+H = 1696
+MARGIN = 96
+WHITE = (255, 255, 255)
+INK = (0, 0, 0)
+QUIET = (55, 55, 55)
+
+FONT_REG = "/usr/share/fonts/noto/NotoSans-Regular.ttf"
+FONT_MED = "/usr/share/fonts/noto/NotoSans-Medium.ttf"
+FONT_BOLD = "/usr/share/fonts/noto/NotoSans-Bold.ttf"
+
+CONFIG = os.path.expanduser("~/.config/kindle-cyberdeck/weather.json")
+CACHE = os.path.expanduser("~/.cache/kindle-cyberdeck")
+PNG_NAME = "00-weather.png"
+ZIP_NAME = "custom-screensaver-0.5.0-kindlehf.zip"
+ZIP_SHA256 = "c025e2f6a7bea882cc8a52320af86964f9814a48a8b7d42d49cf6dee1f043ae0"
+ZIP_URL = (
+    "https://github.com/chengandre/kindle-custom-screensaver"
+    "/releases/download/v0.5.0/" + ZIP_NAME
+)
+PROJECT_ZIP = os.path.expanduser(
+    "~/Projects/kindle-cyberdeck/release/screensavers/" + ZIP_NAME
+)
+
+USER_AGENT = "kindle-cyberdeck-weather/1.0"
+
+
+class WeatherError(Exception):
+    pass
+
+
+def font(path, size):
+    return ImageFont.truetype(path, size)
+
+
+def rnd(value):
+    number = float(value)
+    rounded = math.floor(abs(number) + 0.5)
+    if number < 0:
+        return -rounded
+    return rounded
+
+
+def describe(code):
+    code = int(code)
+    table = (
+        (0, 0, "Clear", "Clear"),
+        (1, 1, "Mostly clear", "Fair"),
+        (2, 2, "Partly cloudy", "Clouds"),
+        (3, 3, "Overcast", "Cloudy"),
+        (45, 48, "Fog", "Fog"),
+        (51, 55, "Drizzle", "Drizzle"),
+        (56, 57, "Freezing drizzle", "Ice"),
+        (61, 61, "Light rain", "Rain"),
+        (63, 63, "Rain", "Rain"),
+        (65, 65, "Heavy rain", "Rain"),
+        (66, 67, "Freezing rain", "Ice"),
+        (71, 77, "Snow", "Snow"),
+        (80, 81, "Showers", "Showers"),
+        (82, 82, "Heavy showers", "Showers"),
+        (85, 86, "Snow showers", "Snow"),
+        (95, 99, "Thunderstorm", "Storm"),
+    )
+    for start, end, long_name, short_name in table:
+        if start <= code <= end:
+            return long_name, short_name
+    return "Weather", "Weather"
+
+
+def http_json(url):
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise WeatherError("Could not reach the forecast service. %s" % exc)
+
+
+def geocode(name):
+    query = urllib.parse.urlencode(
+        {"name": name, "count": 5, "language": "en", "format": "json"}
+    )
+    payload = http_json("https://geocoding-api.open-meteo.com/v1/search?" + query)
+    results = payload.get("results") or []
+    if not results:
+        raise WeatherError("No place named %s." % name)
+    exact = [hit for hit in results if hit.get("name", "").lower() == name.lower()]
+    hit = exact[0] if exact else results[0]
+    place = {
+        "name": hit["name"],
+        "admin": hit.get("admin1") or "",
+        "country": hit.get("country") or "",
+        "latitude": hit["latitude"],
+        "longitude": hit["longitude"],
+        "timezone": hit.get("timezone") or "",
+    }
+    return place
+
+
+def place_line(place):
+    name = place["name"]
+    country = place.get("country") or ""
+    admin = place.get("admin") or ""
+    if country in ("United States", "USA", "United States of America"):
+        return name
+    if admin and admin != name:
+        return "%s, %s" % (name, admin)
+    if country:
+        return "%s, %s" % (name, country)
+    return name
+
+
+def load_place():
+    if not os.path.isfile(CONFIG):
+        return None
+    with open(CONFIG, encoding="utf-8") as handle:
+        place = json.load(handle)
+    for key in ("name", "latitude", "longitude"):
+        if key not in place:
+            raise WeatherError("%s is missing %s." % (CONFIG, key))
+    return place
+
+
+def save_place(place):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    temporary = CONFIG + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(place, handle, indent=2)
+        handle.write("\n")
+    os.replace(temporary, CONFIG)
+
+
+def resolved_label(place):
+    bits = [place["name"]]
+    if place.get("admin"):
+        bits.append(place["admin"])
+    if place.get("country"):
+        bits.append(place["country"])
+    return ", ".join(bits)
+
+
+def fetch_forecast(place):
+    query = urllib.parse.urlencode(
+        {
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "current": ",".join(
+                (
+                    "temperature_2m",
+                    "apparent_temperature",
+                    "weather_code",
+                    "wind_speed_10m",
+                )
+            ),
+            "hourly": "temperature_2m,precipitation_probability,weather_code",
+            "daily": ",".join(
+                (
+                    "weather_code",
+                    "temperature_2m_max",
+                    "temperature_2m_min",
+                    "precipitation_probability_max",
+                )
+            ),
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "timezone": "auto",
+            "forecast_days": 5,
+        }
+    )
+    payload = http_json("https://api.open-meteo.com/v1/forecast?" + query)
+    return view_from_payload(payload, place_line(place))
+
+
+def parse_local(text):
+    return datetime.fromisoformat(text)
+
+
+def hour_label(stamp, now):
+    if stamp.date() == now.date() and stamp.hour == now.hour:
+        return "Now"
+    hour = stamp.strftime("%I").lstrip("0")
+    return "%s %s" % (hour, stamp.strftime("%p"))
+
+
+def view_from_payload(payload, place_name):
+    current = payload["current"]
+    hourly = payload["hourly"]
+    daily = payload["daily"]
+    now = parse_local(current["time"])
+    times = [parse_local(item) for item in hourly["time"]]
+    start = 0
+    for index, stamp in enumerate(times):
+        if stamp.date() == now.date() and stamp.hour == now.hour:
+            start = index
+            break
+        if stamp >= now:
+            start = index
+            break
+    if start + 9 >= len(times):
+        start = max(0, len(times) - 10)
+    hours = []
+    for step in (0, 3, 6, 9):
+        index = start + step
+        _long_name, short_name = describe(hourly["weather_code"][index])
+        pop = hourly["precipitation_probability"][index]
+        hours.append(
+            {
+                "label": hour_label(times[index], now),
+                "temp": rnd(hourly["temperature_2m"][index]),
+                "word": short_name,
+                "pop": 0 if pop is None else int(pop),
+            }
+        )
+    days = []
+    day_times = [parse_local(item) for item in daily["time"]]
+    # Today is the large number. The row is the next four days.
+    for index in range(1, 5):
+        _long_name, short_name = describe(daily["weather_code"][index])
+        pop = daily["precipitation_probability_max"][index]
+        days.append(
+            {
+                "label": day_times[index].strftime("%a"),
+                "high": rnd(daily["temperature_2m_max"][index]),
+                "low": rnd(daily["temperature_2m_min"][index]),
+                "word": short_name,
+                "pop": 0 if pop is None else int(pop),
+            }
+        )
+    condition, _short_name = describe(current["weather_code"])
+    feels = current.get("apparent_temperature")
+    wind = current.get("wind_speed_10m")
+    zone_name = payload.get("timezone") or "America/Los_Angeles"
+    generated = datetime.now(ZoneInfo(zone_name))
+    return {
+        "place": place_name,
+        "weekday": now.strftime("%A"),
+        "date": now.strftime("%B ") + str(now.day),
+        "temp": rnd(current["temperature_2m"]),
+        "feels": None if feels is None else rnd(feels),
+        "wind": None if wind is None else rnd(wind),
+        "condition": condition,
+        "high": rnd(daily["temperature_2m_max"][0]),
+        "low": rnd(daily["temperature_2m_min"][0]),
+        "hours": hours,
+        "days": days,
+        "updated": generated.strftime("%-I:%M %p"),
+    }
+
+
+def text_width(draw, text, face):
+    box = draw.textbbox((0, 0), text, font=face)
+    return box[2] - box[0]
+
+
+def fit_font(draw, text, path, start, minimum, max_width):
+    size = start
+    while size > minimum:
+        face = font(path, size)
+        if text_width(draw, text, face) <= max_width:
+            return face
+        size -= 2
+    return font(path, minimum)
+
+
+class Page(object):
+    def __init__(self):
+        self.image = Image.new("RGB", (W, H), WHITE)
+        self.draw = ImageDraw.Draw(self.image)
+        self.boxes = []
+
+    def text(self, xy, text, face, fill, anchor="lt"):
+        box = self.draw.textbbox(xy, text, font=face, anchor=anchor)
+        self.boxes.append(box)
+        self.draw.text(xy, text, font=face, fill=fill, anchor=anchor)
+        return box
+
+    def rule(self, y):
+        self.draw.rectangle((MARGIN, y, W - MARGIN, y + 2), fill=INK)
+
+    def assert_inside(self):
+        leaks = []
+        for box in self.boxes:
+            if box[0] < 36 or box[1] < 24 or box[2] > W - 36 or box[3] > H - 24:
+                leaks.append(box)
+        if leaks:
+            raise WeatherError("Text leaves the page: %s" % (leaks,))
+        for index, left in enumerate(self.boxes):
+            for right in self.boxes[index + 1 :]:
+                overlap_w = min(left[2], right[2]) - max(left[0], right[0])
+                overlap_h = min(left[3], right[3]) - max(left[1], right[1])
+                if overlap_w > 3 and overlap_h > 3:
+                    raise WeatherError(
+                        "Text overlaps (%s and %s)." % (left, right)
+                    )
+
+
+def column_centers(count):
+    left = MARGIN
+    right = W - MARGIN
+    span = (right - left) / float(count)
+    return [left + span * (index + 0.5) for index in range(count)]
+
+
+def block(page, centers, y, items, face, fill, gap_after):
+    bottom = y
+    for center, text in zip(centers, items):
+        box = page.text((center, y), text, face, fill, anchor="mt")
+        bottom = max(bottom, box[3])
+    return bottom + gap_after
+
+
+def render(view):
+    page = Page()
+    draw = page.draw
+    content_width = W - 2 * MARGIN
+
+    weekday = font(FONT_BOLD, 64)
+    date_face = font(FONT_REG, 42)
+    temp_face = fit_font(
+        draw, "%s°" % view["temp"], FONT_BOLD, 248, 160, content_width
+    )
+    condition = fit_font(
+        draw, view["condition"], FONT_REG, 48, 32, content_width
+    )
+    pair = font(FONT_BOLD, 84)
+    pair_quiet = font(FONT_REG, 84)
+    pair_label = font(FONT_REG, 30)
+    hour_label = font(FONT_MED, 30)
+    hour_temp = font(FONT_BOLD, 58)
+    hour_word = font(FONT_REG, 30)
+    hour_pop = font(FONT_REG, 26)
+    day_label = font(FONT_MED, 30)
+    day_high = font(FONT_BOLD, 52)
+    day_low = font(FONT_REG, 36)
+    day_word = font(FONT_REG, 30)
+    day_pop = font(FONT_REG, 26)
+    place_face = fit_font(draw, view["place"], FONT_MED, 40, 28, content_width)
+    updated = font(FONT_REG, 30)
+    note_face = font(FONT_REG, 32)
+
+    page.draw.rectangle((MARGIN, 100, MARGIN + 72, 106), fill=INK)
+    box = page.text((MARGIN, 132), view["weekday"], weekday, INK)
+    box = page.text((MARGIN, box[3] + 10), view["date"], date_face, QUIET)
+    y = box[3] + 56
+
+    box = page.text((W / 2, y), "%s°" % view["temp"], temp_face, INK, anchor="mt")
+    y = box[3] + 28
+    box = page.text((W / 2, y), view["condition"], condition, INK, anchor="mt")
+    y = box[3] + 18
+
+    feels = view.get("feels")
+    notes = []
+    if feels is not None and abs(feels - view["temp"]) >= 3:
+        notes.append("Feels %s°" % feels)
+    wind = view.get("wind")
+    if wind is not None and wind >= 18:
+        notes.append("Wind %s mph" % wind)
+    if notes:
+        box = page.text((W / 2, y), "   ".join(notes), note_face, QUIET, anchor="mt")
+        y = box[3] + 28
+    else:
+        y += 12
+
+    high_x = W / 2 - 210
+    low_x = W / 2 + 210
+    high_box = page.text((high_x, y), "%s°" % view["high"], pair, INK, anchor="mt")
+    low_box = page.text((low_x, y), "%s°" % view["low"], pair_quiet, QUIET, anchor="mt")
+    y = max(high_box[3], low_box[3]) + 16
+    high_box = page.text((high_x, y), "high", pair_label, QUIET, anchor="mt")
+    low_box = page.text((low_x, y), "low", pair_label, QUIET, anchor="mt")
+    y = max(high_box[3], low_box[3]) + 48
+    page.rule(y)
+    y += 44
+
+    hours = view["hours"]
+    centers = column_centers(len(hours))
+    show_hour_pop = any(item["pop"] >= 20 for item in hours)
+    y = block(page, centers, y, [item["label"] for item in hours], hour_label, QUIET, 18)
+    y = block(
+        page, centers, y, ["%s°" % item["temp"] for item in hours], hour_temp, INK, 12
+    )
+    y = block(page, centers, y, [item["word"] for item in hours], hour_word, INK, 10)
+    if show_hour_pop:
+        y = block(
+            page,
+            centers,
+            y,
+            ["%s%%" % item["pop"] for item in hours],
+            hour_pop,
+            QUIET,
+            8,
+        )
+    y += 28
+    page.rule(y)
+    y += 40
+
+    days = view["days"]
+    centers = column_centers(len(days))
+    show_day_pop = any(item["pop"] >= 20 for item in days)
+    y = block(page, centers, y, [item["label"] for item in days], day_label, QUIET, 16)
+    y = block(
+        page, centers, y, ["%s°" % item["high"] for item in days], day_high, INK, 8
+    )
+    y = block(
+        page, centers, y, ["%s°" % item["low"] for item in days], day_low, QUIET, 12
+    )
+    y = block(page, centers, y, [item["word"] for item in days], day_word, INK, 8)
+    if show_day_pop:
+        y = block(
+            page,
+            centers,
+            y,
+            ["%s%%" % item["pop"] for item in days],
+            day_pop,
+            QUIET,
+            8,
+        )
+
+    # Keep the place with the date's left edge, and clear of the last row.
+    y = max(y + 48, H - 230)
+    box = page.text((MARGIN, y), view["place"], place_face, INK)
+    page.text((MARGIN, box[3] + 10), "Updated %s" % view["updated"], updated, QUIET)
+    page.assert_inside()
+    return page.image
+
+
+def write_png(image, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    image.save(path, "PNG", optimize=True)
+
+
+def kindle_storage():
+    listed = subprocess.run(
+        ["gio", "mount", "-l"], check=True, capture_output=True, text=True
+    )
+    root = None
+    for line in listed.stdout.splitlines():
+        marker = "-> mtp://"
+        if marker in line and "Kindle" in line:
+            root = "mtp://" + line.split(marker, 1)[1].strip().split()[0].removeprefix("mtp://")
+            break
+    if not root:
+        raise WeatherError("The Kindle is not plugged in.")
+    if not root.endswith("/"):
+        root += "/"
+    children = subprocess.run(
+        ["gio", "list", root], capture_output=True, text=True
+    )
+    if children.returncode != 0 or "Internal Storage" not in children.stdout.splitlines():
+        raise WeatherError("The Kindle is plugged in, but its storage is not open.")
+    return root + "Internal Storage"
+
+
+def gio_mkdir(uri):
+    subprocess.run(["gio", "mkdir", uri], capture_output=True, text=True)
+
+
+def safe_remove(uri):
+    allowed = (
+        uri.endswith("/" + PNG_NAME)
+        or uri.endswith("/Custom Screensaver.sh")
+        or "/extensions/custom-screensaver/" in uri
+        or uri.endswith("/extensions/custom-screensaver")
+        or uri.endswith("/screensavers/README.txt")
+    )
+    if not allowed:
+        raise WeatherError("Refusing to remove %s" % uri)
+    subprocess.run(["gio", "remove", uri], capture_output=True, text=True)
+
+
+def gio_copy(source, uri):
+    safe_remove(uri)
+    result = subprocess.run(
+        ["gio", "copy", source, uri], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "gio copy failed").strip()
+        raise WeatherError(detail)
+
+
+def ensure_dir(storage, relative):
+    current = storage
+    if relative:
+        for part in relative.split("/"):
+            current = current + "/" + part
+            gio_mkdir(current)
+    return current
+
+
+def copy_png(storage, png_path):
+    folder = ensure_dir(storage, "screensavers")
+    names = subprocess.run(
+        ["gio", "list", folder], capture_output=True, text=True
+    )
+    others = []
+    if names.returncode == 0:
+        for name in names.stdout.splitlines():
+            lower = name.lower()
+            if lower == PNG_NAME:
+                continue
+            if lower.endswith((".png", ".jpg", ".jpeg")):
+                others.append(name)
+    gio_copy(png_path, folder + "/" + PNG_NAME)
+    return others
+
+
+def zip_path():
+    if os.path.isfile(PROJECT_ZIP):
+        return PROJECT_ZIP
+    cached = os.path.join(CACHE, ZIP_NAME)
+    if os.path.isfile(cached):
+        return cached
+    os.makedirs(CACHE, exist_ok=True)
+    urllib.request.urlretrieve(ZIP_URL, cached)
+    return cached
+
+
+def sha256_file(path):
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def install_runtime(storage):
+    archive = zip_path()
+    digest = sha256_file(archive)
+    if digest != ZIP_SHA256:
+        raise WeatherError("Screensaver package hash does not match v0.5.0.")
+    import zipfile
+
+    staging = os.path.join(CACHE, "custom-screensaver-0.5.0")
+    if os.path.isdir(staging):
+        import shutil
+
+        shutil.rmtree(staging)
+    with zipfile.ZipFile(archive) as package:
+        package.extractall(staging)
+    copied = []
+    for dirpath, _dirnames, filenames in os.walk(staging):
+        for name in filenames:
+            local = os.path.join(dirpath, name)
+            relative = os.path.relpath(local, staging).replace(os.sep, "/")
+            if relative.endswith(PNG_NAME):
+                continue
+            parent = os.path.dirname(relative)
+            ensure_dir(storage, parent)
+            gio_copy(local, storage + "/" + relative)
+            copied.append(relative)
+    return copied
+
+
+def fixture(temp=64, condition="Partly cloudy", pop=True):
+    return {
+        "place": "San Francisco",
+        "weekday": "Sunday",
+        "date": "October 25",
+        "temp": temp,
+        "feels": temp - 4,
+        "wind": 6,
+        "condition": condition,
+        "high": temp + 4,
+        "low": temp - 13,
+        "hours": [
+            {"label": "Now", "temp": temp, "word": "Fair", "pop": 0},
+            {"label": "5 PM", "temp": temp - 1, "word": "Clouds", "pop": 10},
+            {"label": "8 PM", "temp": temp - 6, "word": "Clear", "pop": 0},
+            {"label": "11 PM", "temp": temp - 9, "word": "Clear", "pop": 40 if pop else 0},
+        ],
+        "days": [
+            {"label": "Mon", "high": 67, "low": 52, "word": "Rain", "pop": 60 if pop else 0},
+            {"label": "Tue", "high": 64, "low": 49, "word": "Clouds", "pop": 20 if pop else 0},
+            {"label": "Wed", "high": 63, "low": 48, "word": "Fair", "pop": 0},
+            {"label": "Thu", "high": 70, "low": 53, "word": "Clear", "pop": 0},
+        ],
+        "updated": "2:04 PM",
+    }
+
+
+def self_test():
+    first = render(fixture())
+    if first.size != (W, H):
+        raise WeatherError("Unexpected size %s" % (first.size,))
+    corner = first.getpixel((0, 0))
+    if corner != WHITE:
+        raise WeatherError("Page is not white.")
+    dark = 0
+    for y in range(0, H, 4):
+        for x in range(0, W, 4):
+            pixel = first.getpixel((x, y))
+            if pixel[0] < 40:
+                dark += 1
+    if dark < 80:
+        raise WeatherError("Page has almost no ink.")
+    render(fixture(temp=102, condition="Thunderstorm", pop=False))
+    render(fixture(temp=-8, condition="Heavy rain", pop=True))
+    path = "/tmp/kindle-weather-preview.png"
+    first.save(path, "PNG")
+    print(path)
+    return 0
+
+
+def usage():
+    print(
+        "Usage: kindle-weather [--place CITY] [--install] [--no-copy]\n"
+        "       kindle-weather --self-test\n"
+        "The picture updates only while the Kindle is awake and plugged in.",
+        file=sys.stderr,
+    )
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    place_name = None
+    do_install = False
+    do_copy = True
+    args = argv[1:]
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--place":
+            if index + 1 >= len(args):
+                usage()
+                return 2
+            place_name = args[index + 1]
+            index += 2
+            continue
+        if arg == "--install":
+            do_install = True
+            index += 1
+            continue
+        if arg == "--no-copy":
+            do_copy = False
+            index += 1
+            continue
+        usage()
+        return 2
+
+    if place_name:
+        place = geocode(place_name)
+        save_place(place)
+        print("Place: %s" % resolved_label(place))
+    else:
+        place = load_place()
+        if not place:
+            raise WeatherError(
+                "No place is saved. Run kindle-weather --place \"City Name\"."
+            )
+        print("Place: %s" % resolved_label(place))
+
+    view = fetch_forecast(place)
+    os.makedirs(CACHE, exist_ok=True)
+    png_path = os.path.join(CACHE, PNG_NAME)
+    write_png(render(view), png_path)
+    print(
+        "Forecast: %s°, %s, high %s°, low %s°. %s"
+        % (view["temp"], view["condition"], view["high"], view["low"], view["updated"])
+    )
+    print(png_path)
+
+    if not do_copy and not do_install:
+        return 0
+
+    storage = kindle_storage()
+    if do_install:
+        copied = install_runtime(storage)
+        print("Installed %s screensaver files." % len(copied))
+    others = copy_png(storage, png_path)
+    print("Copied %s to the Kindle." % PNG_NAME)
+    if others:
+        print(
+            "Other pictures in screensavers/ will take turns with the forecast: %s"
+            % ", ".join(others)
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except WeatherError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,22 @@
+#!/bin/sh
+# deck-connect HOST SESSION REMOTE
+# SESSION is a tmux name on the remote machine. Attaching again resumes it.
+HOST=$1
+SESSION=$2
+REMOTE=$3
+if [ -z "$HOST" ] || [ -z "$SESSION" ]; then
+	echo "usage: deck-connect HOST SESSION [REMOTE]"
+	exit 1
+fi
+case "$SESSION" in
+  *[!a-zA-Z0-9_-]*) echo "Invalid session name." >&2; exit 1 ;;
+esac
+. /usr/local/bin/deck-net
+echo "Connecting to $HOST..."
+deck_net_ready || exit 1
+# SSH's initial PATH on macOS omits Homebrew. Set it for this command only.
+remote_prefix='export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
+if [ -n "$REMOTE" ]; then
+	exec ssh -tt "$HOST" "${remote_prefix}exec tmux -u new-session -A -s $SESSION -- bash -lc '$REMOTE'"
+fi
+exec ssh -tt "$HOST" "${remote_prefix}exec tmux -u new-session -A -s $SESSION -- \"\${SHELL:-/bin/sh}\" -l"

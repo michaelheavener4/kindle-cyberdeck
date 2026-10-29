@@ -1,0 +1,8 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+if [ "${1:-reader}" = sleep ]; then
+  : >/mnt/kindle/linux/sleep-after-exit
+else
+  rm -f /mnt/kindle/linux/sleep-after-exit
+fi
+exec jwm -exit

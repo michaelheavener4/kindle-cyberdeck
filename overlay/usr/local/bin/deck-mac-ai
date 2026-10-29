@@ -1,0 +1,6 @@
+#!/bin/sh
+case "${1:-fm}" in
+  fm) exec /usr/local/bin/deck-connect mac fm 'exec env NO_COLOR=1 /usr/bin/fm chat' ;;
+  local) exec /usr/local/bin/deck-connect mac local-ai 'exec "$HOME/.local/bin/kindle-local-ai"' ;;
+  *) echo 'usage: deck-mac-ai fm|local' >&2; exit 2 ;;
+esac

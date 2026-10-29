@@ -1,0 +1,292 @@
+#!/usr/bin/python3
+"""Touch pad for mGBA. Sends real key events to the emulator window.
+
+Directions, B, and A stay down while the finger is down, which is how
+Pokemon walks and runs. QUIT closes the emulator window so it flushes
+the cartridge save.
+"""
+import os
+import ctypes
+import signal
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk
+
+KEYS = {
+    "Up": "Up",
+    "Down": "Down",
+    "Left": "Left",
+    "Right": "Right",
+    "B": "z",
+    "A": "x",
+    "Select": "BackSpace",
+    "Start": "Return",
+    "Fast": "Tab",
+}
+
+
+class Pad(Gtk.Window):
+    def __init__(self, pid, scale):
+        super().__init__(title="Game Boy")
+        self.pid = pid
+        self.scale = scale
+        self.wid = None
+        self.down = set()
+        self.set_decorated(False)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.connect("destroy", self._on_destroy)
+        # Set the intended geometry before mapping; an e-ink panel can keep
+        # the first, small window image after it has moved out of the way.
+        screen = self.get_screen()
+        sw = screen.get_width()
+        sh = screen.get_height()
+        top = min(144 * scale + 8, sh - 112 - 353)
+        self.set_default_size(sw, sh - 112 - top)
+        self.move(0, top)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+            window, box, grid { background: #ffffff; }
+            button {
+                background: #ffffff;
+                color: #000000;
+                border: 4px solid #000000;
+                font-weight: bold;
+                font-size: 30px;
+                border-radius: 6px;
+            }
+            button:active { background: #000000; color: #ffffff; }
+            #face { font-size: 42px; }
+            label { color: #000000; font-size: 22px; }
+        """)
+        Gtk.StyleContext.add_provider_for_screen(
+            self.get_screen(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_margin_start(8)
+        outer.set_margin_end(8)
+        outer.set_margin_top(8)
+        outer.set_margin_bottom(8)
+        self.add(outer)
+
+        self.status = Gtk.Label(
+            label="QUIT writes the cartridge save. SAVE/LOAD are state 1."
+        )
+        self.status.set_line_wrap(True)
+        self.status.set_xalign(0)
+        outer.pack_start(self.status, False, False, 0)
+
+        pad = Gtk.Grid(column_spacing=8, row_spacing=8)
+        pad.set_column_homogeneous(True)
+        pad.set_row_homogeneous(True)
+        outer.pack_start(pad, True, True, 0)
+
+        self._hold(pad, "Up", 1, 0)
+        self._hold(pad, "Left", 0, 1)
+        self._hold(pad, "Right", 2, 1)
+        self._hold(pad, "Down", 1, 2)
+        self._hold(pad, "B", 3, 0, 1, 2, face=True)
+        self._hold(pad, "A", 4, 0, 1, 2, face=True)
+        self._hold(pad, "Select", 0, 3, 1, 1)
+        self._hold(pad, "Start", 1, 3, 1, 1)
+        self._hold(pad, "Fast", 2, 3, 1, 1)
+
+        save = self._click("SAVE", self._save_state)
+        load = self._click("LOAD", self._load_state)
+        quitb = self._click("QUIT", self._quit)
+        pad.attach(save, 3, 3, 1, 1)
+        pad.attach(load, 4, 3, 1, 1)
+        pad.attach(quitb, 0, 4, 5, 1)
+
+        GLib.timeout_add(300, self._find_window)
+        GLib.timeout_add(1000, self._watch_game)
+
+    def _button(self, label, face=False):
+        button = Gtk.Button(label=label)
+        button.set_can_focus(False)
+        button.set_hexpand(True)
+        button.set_vexpand(True)
+        if face:
+            button.set_name("face")
+        return button
+
+    def _hold(self, grid, label, left, top, width=1, height=1, face=False):
+        button = self._button(label, face=face)
+        key = KEYS[label]
+        button.connect("button-press-event", lambda *_a: self._down(key))
+        button.connect("button-release-event", lambda *_a: self._up(key))
+        grid.attach(button, left, top, width, height)
+
+    def _click(self, label, handler):
+        button = self._button(label)
+        button.connect("clicked", lambda *_a: handler())
+        return button
+
+    def _send(self, action, key):
+        if not self.wid:
+            return
+        subprocess.call(
+            ["xdotool", "windowfocus", self.wid, action, key],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _down(self, key):
+        if key not in self.down:
+            self.down.add(key)
+            self._send("keydown", key)
+        return False
+
+    def _up(self, key):
+        if key in self.down:
+            self.down.discard(key)
+            self._send("keyup", key)
+        return False
+
+    def _release_all(self):
+        for key in list(self.down):
+            self._up(key)
+
+    def _find_window(self):
+        if self.wid:
+            return False
+        try:
+            out = subprocess.check_output(
+                ["xdotool", "search", "--onlyvisible", "--pid", str(self.pid)],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return True
+        ids = [line.strip() for line in out.splitlines() if line.strip()]
+        if not ids:
+            return True
+        self.wid = ids[-1]
+        self._remove_game_frame()
+        # Let JWM apply the decoration change before measuring the game.
+        GLib.timeout_add(200, self._place)
+        return False
+
+    def _remove_game_frame(self):
+        x11 = ctypes.CDLL("libX11.so.6")
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x11.XInternAtom.restype = ctypes.c_ulong
+        x11.XChangeProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_int,
+        ]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        display = x11.XOpenDisplay(None)
+        if not display:
+            return
+        try:
+            atom = x11.XInternAtom(display, b"_MOTIF_WM_HINTS", 0)
+            # MWM_HINTS_DECORATIONS, with decorations disabled.
+            hints = (ctypes.c_ulong * 5)(2, 0, 0, 0, 0)
+            x11.XChangeProperty(
+                display, int(self.wid), atom, atom, 32, 0,
+                ctypes.cast(hints, ctypes.POINTER(ctypes.c_ubyte)), 5,
+            )
+        finally:
+            x11.XCloseDisplay(display)
+
+    def _place(self):
+        screen = self.get_screen()
+        sw = screen.get_width()
+        sh = screen.get_height()
+        tray = 112
+        try:
+            geo = subprocess.check_output(
+                ["xdotool", "getwindowgeometry", "--shell", self.wid],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            height = 0
+            width = 160 * self.scale
+            for line in geo.splitlines():
+                if line.startswith("HEIGHT="):
+                    height = int(line.split("=", 1)[1])
+                elif line.startswith("WIDTH="):
+                    width = int(line.split("=", 1)[1])
+            top = height + 8
+        except (subprocess.CalledProcessError, ValueError):
+            top = 144 * self.scale + 100
+            width = 160 * self.scale
+        if top < 200:
+            top = 200
+        if top > sh - tray - 240:
+            top = sh - tray - 240
+        subprocess.call(
+            ["xdotool", "windowmove", self.wid, str(max(0, (sw - width) // 2)), "0"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.resize(sw, sh - tray - top)
+        self.move(0, top)
+        return False
+
+    def _watch_game(self):
+        try:
+            os.kill(self.pid, 0)
+        except OSError:
+            self._release_all()
+            Gtk.main_quit()
+            return False
+        return True
+
+    def _save_state(self):
+        self._release_all()
+        self._send("key", "shift+F1")
+        self.status.set_text("State 1 saved. The cartridge file is written on QUIT.")
+
+    def _load_state(self):
+        self._release_all()
+        self._send("key", "F1")
+        self.status.set_text("Loaded state 1.")
+
+    def _quit(self):
+        self._release_all()
+        if self.wid:
+            subprocess.call(
+                ["xdotool", "windowclose", self.wid],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except OSError:
+                pass
+        GLib.timeout_add(400, self._watch_game)
+
+    def _on_destroy(self, *_a):
+        self._release_all()
+        Gtk.main_quit()
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: gb-pad PID SCALE", file=sys.stderr)
+        return 2
+    pid = int(sys.argv[1])
+    scale = int(sys.argv[2])
+    win = Pad(pid, scale)
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

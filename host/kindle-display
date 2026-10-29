@@ -1,0 +1,389 @@
+#!/usr/bin/python3
+"""On-demand e-ink screen for the Kindle, driven by this Omarchy session.
+
+start creates a headless Hyprland output named kindle, 1272x1696 at scale 4,
+to the right of eDP-1, then focuses the laptop panel. stop removes it.
+grab writes one gzipped grayscale PPM to stdout.
+
+Scale 4 is the largest integer scale that divides both 1272 and 1696
+(logical 318x424). A 14px interface font is then about 56 device pixels,
+near the journal body. 1696 is not divisible by 3, so scale 3 is rejected
+by Hyprland. Nothing here is written into the Hyprland config, and this
+process does not stay running.
+
+The picture is grayscale (red = green = blue) so Xephyr's 8-bit picture
+does not shimmer between frames that a person would call the same.
+"""
+
+import gzip
+import json
+import os
+import subprocess
+import sys
+
+PANEL_W = 1272
+PANEL_H = 1696
+SCALE = 4
+NAME = "kindle"
+LAPTOP = "eDP-1"
+HYPRCTL = "/usr/bin/hyprctl"
+GRIM = "/usr/bin/grim"
+
+_ENV = None
+
+
+class SessionError(Exception):
+    pass
+
+
+def session_env():
+    """Find the running Hyprland when this is started over SSH."""
+    global _ENV
+    if _ENV is not None:
+        return _ENV
+    env = os.environ.copy()
+    runtime = env.get("XDG_RUNTIME_DIR") or ("/run/user/%s" % os.getuid())
+    env["XDG_RUNTIME_DIR"] = runtime
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        base = os.path.join(runtime, "hypr")
+        found = []
+        if os.path.isdir(base):
+            for name in os.listdir(base):
+                sock = os.path.join(base, name, ".socket.sock")
+                if os.path.exists(sock):
+                    found.append(name)
+        if len(found) != 1:
+            if not found:
+                raise SessionError("Hyprland is not running.")
+            raise SessionError("More than one Hyprland is running.")
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = found[0]
+    if not env.get("WAYLAND_DISPLAY"):
+        for candidate in ("wayland-1", "wayland-0"):
+            if os.path.exists(os.path.join(runtime, candidate)):
+                env["WAYLAND_DISPLAY"] = candidate
+                break
+        else:
+            raise SessionError("The Wayland socket was not found.")
+    _ENV = env
+    return env
+
+
+def run(args):
+    return subprocess.run(
+        args,
+        capture_output=True,
+        env=session_env(),
+    )
+
+
+def monitors():
+    proc = run([HYPRCTL, "monitors", "-j"])
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+        raise SessionError(err or "hyprctl monitors failed.")
+    try:
+        data = json.loads(proc.stdout.decode("utf-8"))
+    except ValueError as exc:
+        raise SessionError("hyprctl monitors did not return JSON.") from exc
+    if not isinstance(data, list):
+        raise SessionError("hyprctl monitors did not return a list.")
+    return data
+
+
+def find_monitor(items, name):
+    for item in items:
+        if item.get("name") == name:
+            return item
+    return None
+
+
+def layout_x(width, scale):
+    """Right-hand edge of a panel, in Hyprland layout pixels."""
+    scale = float(scale)
+    if scale <= 0:
+        raise ValueError("scale")
+    layout = float(width) / scale
+    if abs(layout - round(layout)) > 0.01:
+        raise ValueError("fractional")
+    return int(round(layout))
+
+
+def parse_p6(blob):
+    if len(blob) < 10 or blob[:2] != b"P6":
+        raise ValueError("The picture is not a PPM.")
+    i = 2
+    tokens = []
+    n = len(blob)
+    while len(tokens) < 3:
+        if i >= n:
+            raise ValueError("The picture header is short.")
+        c = blob[i]
+        if c in (9, 10, 13, 32):
+            i += 1
+            continue
+        if c == 35:
+            while i < n and blob[i] != 10:
+                i += 1
+            continue
+        start = i
+        while i < n and blob[i] not in (9, 10, 13, 32):
+            i += 1
+        tokens.append(blob[start:i])
+    if i >= n or blob[i] not in (9, 10, 13, 32):
+        raise ValueError("The picture header is not finished.")
+    i += 1
+    try:
+        width = int(tokens[0])
+        height = int(tokens[1])
+        maxval = int(tokens[2])
+    except ValueError as exc:
+        raise ValueError("The picture header is not numbers.") from exc
+    if width < 1 or height < 1 or width > 4000 or height > 4000:
+        raise ValueError("The picture size is unexpected.")
+    if maxval != 255:
+        raise ValueError("The picture maxval is not 255.")
+    need = width * height * 3
+    pixels = blob[i : i + need]
+    if len(pixels) != need:
+        raise ValueError("The picture is short.")
+    return width, height, pixels
+
+
+def gray_601(pixels):
+    """Integer Rec. 601. Pillow is preferred; this keeps grab working without it."""
+    src = pixels
+    n = len(src)
+    out = bytearray(n)
+    i = 0
+    while i < n:
+        y = (src[i] * 77 + src[i + 1] * 150 + src[i + 2] * 29) >> 8
+        out[i] = y
+        out[i + 1] = y
+        out[i + 2] = y
+        i += 3
+    return bytes(out)
+
+
+def to_gray(pixels, width, height):
+    try:
+        from PIL import Image
+    except ImportError:
+        return gray_601(pixels)
+    image = Image.frombytes("RGB", (width, height), pixels)
+    return image.convert("L").convert("RGB").tobytes()
+
+
+def gray_ppm(blob):
+    width, height, pixels = parse_p6(blob)
+    gray = to_gray(pixels, width, height)
+    if len(gray) != len(pixels):
+        raise ValueError("The grayscale picture changed size.")
+    header = ("P6\n%d %d\n255\n" % (width, height)).encode("ascii")
+    return header + gray
+
+
+def mode_text(kindle):
+    if kindle is None:
+        return "missing"
+    return "%sx%s scale %s at %s" % (
+        kindle.get("width"),
+        kindle.get("height"),
+        kindle.get("scale"),
+        kindle.get("x"),
+    )
+
+
+def mode_ok(kindle, edge):
+    if kindle is None:
+        return False
+    try:
+        width = int(kindle.get("width"))
+        height = int(kindle.get("height"))
+        scale = float(kindle.get("scale"))
+        x = int(kindle.get("x"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        width == PANEL_W
+        and height == PANEL_H
+        and abs(scale - SCALE) < 0.01
+        and x == edge
+    )
+
+
+def remove_output():
+    run([HYPRCTL, "output", "remove", NAME])
+
+
+def focus_laptop():
+    run([HYPRCTL, "dispatch", "focusmonitor", LAPTOP])
+
+
+def start():
+    items = monitors()
+    laptop = find_monitor(items, LAPTOP)
+    if laptop is None:
+        sys.stderr.write("The laptop panel eDP-1 is not connected.\n")
+        return 1
+    try:
+        edge = layout_x(laptop.get("width"), laptop.get("scale") or 1)
+    except (TypeError, ValueError):
+        sys.stderr.write("The laptop panel does not end on a whole pixel.\n")
+        return 1
+    created = find_monitor(items, NAME) is None
+    if created:
+        proc = run([HYPRCTL, "output", "create", "headless", NAME])
+        if find_monitor(monitors(), NAME) is None:
+            err = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+            sys.stderr.write(err or "The Kindle output was not created.\n")
+            return 1
+    lua = (
+        'hl.monitor({ output = "%s", disabled = false, '
+        'mode = "%dx%d@1", position = "%dx0", scale = %d })'
+        % (NAME, PANEL_W, PANEL_H, edge, SCALE)
+    )
+    proc = run([HYPRCTL, "eval", lua])
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+        sys.stderr.write(err or "The Kindle output mode was rejected.\n")
+        if created:
+            remove_output()
+        return 1
+    kindle = find_monitor(monitors(), NAME)
+    if not mode_ok(kindle, edge):
+        sys.stderr.write(
+            "The Kindle output came up as %s, not %sx%s scale %s at %sx0.\n"
+            % (mode_text(kindle), PANEL_W, PANEL_H, SCALE, edge)
+        )
+        remove_output()
+        return 1
+    focus_laptop()
+    sys.stdout.write("kindle display on\n")
+    return 0
+
+
+def stop():
+    try:
+        items = monitors()
+    except SessionError:
+        sys.stdout.write("kindle display is already off\n")
+        return 0
+    if find_monitor(items, NAME) is None:
+        focus_laptop()
+        sys.stdout.write("kindle display is already off\n")
+        return 0
+    proc = run([HYPRCTL, "output", "remove", NAME])
+    if find_monitor(monitors(), NAME) is not None:
+        err = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+        sys.stderr.write(err or "The Kindle output is still there.\n")
+        return 1
+    focus_laptop()
+    sys.stdout.write("kindle display off\n")
+    return 0
+
+
+def grab():
+    if sys.stdout.isatty():
+        sys.stderr.write("grab writes a gzipped picture. Redirect it to a file.\n")
+        return 1
+    if find_monitor(monitors(), NAME) is None:
+        sys.stderr.write("The Omarchy screen is not on.\n")
+        return 1
+    proc = run([GRIM, "-o", NAME, "-t", "ppm", "-"])
+    if proc.returncode != 0 or not proc.stdout:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        sys.stderr.write((err + "\n") if err else "The picture could not be taken.\n")
+        return 1
+    try:
+        width, height, _pixels = parse_p6(proc.stdout)
+        if (width, height) != (PANEL_W, PANEL_H):
+            sys.stderr.write(
+                "The Kindle output is %sx%s, not %sx%s.\n"
+                % (width, height, PANEL_W, PANEL_H)
+            )
+            return 1
+        ppm = gray_ppm(proc.stdout)
+    except ValueError as exc:
+        sys.stderr.write(str(exc) + "\n")
+        return 1
+    sys.stdout.buffer.write(gzip.compress(ppm, compresslevel=6))
+    return 0
+
+
+def self_test():
+    assert PANEL_W % SCALE == 0
+    assert PANEL_H % SCALE == 0
+    assert PANEL_H % 3 != 0
+    assert layout_x(1366, 1) == 1366
+    assert layout_x(1272, 4) == 318
+    try:
+        layout_x(1696, 3)
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("scale 3 should not be a whole layout")
+
+    raw = b"P6\n# note\n2 1\n255\n" + bytes([255, 0, 0, 0, 0, 0])
+    width, height, pixels = parse_p6(raw)
+    assert (width, height) == (2, 1)
+    assert pixels[:3] == b"\xff\x00\x00"
+    slow = gray_601(pixels)
+    assert slow[:3] == bytes([76, 76, 76])
+    assert slow[3:] == bytes([0, 0, 0])
+    white = gray_601(bytes([255, 255, 255]))
+    assert white == bytes([255, 255, 255])
+
+    ppm = gray_ppm(raw)
+    width, height, gray = parse_p6(ppm)
+    assert (width, height) == (2, 1)
+    assert gray[0] == gray[1] == gray[2]
+    assert gray[0] not in (0, 255)
+    assert gray[3:] == bytes([0, 0, 0])
+    assert len(gray) == 6
+    again = gray_ppm(raw)
+    assert again == ppm
+
+    try:
+        parse_p6(b"P6\n1 1\n255\n\x00")
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("a short picture was accepted")
+    try:
+        parse_p6(b"P5\n1 1\n255\n\x00")
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("a P5 picture was accepted")
+    print("kindle-display self-test ok")
+    return 0
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in (
+        "start",
+        "stop",
+        "grab",
+        "--self-test",
+    ):
+        sys.stderr.write("usage: kindle-display start|stop|grab\n")
+        return 2
+    cmd = sys.argv[1]
+    if cmd == "--self-test":
+        return self_test()
+    try:
+        if cmd == "start":
+            return start()
+        if cmd == "stop":
+            return stop()
+        return grab()
+    except SessionError as exc:
+        if cmd == "stop":
+            sys.stdout.write("kindle display is already off\n")
+            return 0
+        sys.stderr.write(str(exc) + "\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

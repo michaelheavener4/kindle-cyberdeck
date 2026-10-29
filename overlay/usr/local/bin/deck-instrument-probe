@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Read-only Linux/macOS telemetry. Stdlib only; never starts services/models."""
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import sqlite3
+import subprocess
+import time
+import urllib.request
+
+WATCH = {'codex':'Codex', 'opencode':'OpenCode', 'grok':'Grok', 'claude':'Claude',
+         'ollama':'Ollama', 'cyberpunk2077':'Cyberpunk', 'tailscaled':'Tailscale',
+         'jwm':'JWM', 'dropbear':'SSH'}
+
+
+def command(args, timeout=2):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return result.stdout[:200000] if result.returncode == 0 else ''
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+def linux_memory(text):
+    values = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) > 1 and parts[1].isdigit():values[parts[0].rstrip(':')] = int(parts[1]) * 1024
+    total = values.get('MemTotal', 0)
+    available = values.get('MemAvailable', values.get('MemFree',0)+values.get('Buffers',0)+values.get('Cached',0))
+    return {'total':total, 'used':max(0,total-available)} if total else None
+
+
+def mac_memory(total, text):
+    match = re.search(r'page size of (\d+) bytes', text)
+    if not match or not total:return None
+    pages = {}
+    for line in text.splitlines():
+        match_value = re.match(r'([^:]+):\s+(\d+)\.', line)
+        if match_value:pages[match_value[1]] = int(match_value[2])
+    available = sum(pages.get(key,0) for key in ('Pages free','Pages inactive','Pages speculative')) * int(match[1])
+    return {'total':total,'used':max(0,min(total,total-available))}
+
+
+def sessions(text):
+    items = []
+    for line in text.splitlines()[:16]:
+        parts = line.split('\t')
+        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            items.append({'name':''.join(c for c in parts[0] if c.isprintable())[:60],
+                          'attached':int(parts[1])>0,'windows':int(parts[2])})
+    return items
+
+
+def process_watch(names):
+    counts = {}
+    for name in names:
+        key = Path(name.strip()).name.lower()
+        if key in WATCH:counts[WATCH[key]] = counts.get(WATCH[key],0)+1
+    return [{'name':key,'count':value} for key,value in sorted(counts.items())]
+
+
+def models():
+    try:
+        request=urllib.request.Request('http://127.0.0.1:11434/api/ps',headers={'Accept':'application/json'})
+        with urllib.request.urlopen(request,timeout=0.8) as response:
+            data=json.loads(response.read(200000))
+        return {'available':True,'loaded':[str(m.get('name',''))[:160] for m in data.get('models',[])[:12]]}
+    except (OSError, ValueError):
+        return {'available':False,'loaded':[]}
+
+
+def queued_work():
+    path=Path.home()/'.local/share/kindle-hub/chats.sqlite3'
+    if not path.is_file():return None
+    connection=None
+    try:
+        connection=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=0.2)
+        transfers=connection.execute("SELECT COUNT(*) FROM archive_jobs WHERE state IN ('queued','working')").fetchone()[0]
+        replies=connection.execute("SELECT COUNT(*) FROM messages WHERE status='pending'").fetchone()[0]
+        return {'transfers':transfers,'replies':replies}
+    except sqlite3.Error:return None
+    finally:
+        if connection is not None:connection.close()
+
+
+def battery():
+    try:
+        for path in Path('/sys/class/power_supply').iterdir():
+            capacity=path/'capacity'
+            if capacity.exists():
+                value=int(capacity.read_text().strip())
+                status=(path/'status').read_text().strip() if (path/'status').exists() else ''
+                return {'percent':max(0,min(100,value)),'status':status}
+    except (OSError, ValueError):pass
+    return None
+
+
+def snapshot():
+    system=platform.system()
+    memory=None;uptime=None
+    if system=='Linux':
+        try:memory=linux_memory(Path('/proc/meminfo').read_text())
+        except OSError:pass
+        try:uptime=int(float(Path('/proc/uptime').read_text().split()[0]))
+        except (OSError,ValueError,IndexError):pass
+        names=[]
+        try:
+            for path in Path('/proc').iterdir():
+                if path.name.isdigit():
+                    try:names.append((path/'comm').read_text().strip())
+                    except OSError:pass
+        except OSError:pass
+    else:
+        try:total=int(command(['/usr/sbin/sysctl','-n','hw.memsize']).strip())
+        except ValueError:total=0
+        memory=mac_memory(total,command(['/usr/bin/vm_stat']))
+        match=re.search(r'sec\s*=\s*(\d+)',command(['/usr/sbin/sysctl','-n','kern.boottime']))
+        if match:uptime=max(0,int(time.time())-int(match[1]))
+        names=command(['/bin/ps','-axo','comm=']).splitlines()
+    try:load=list(os.getloadavg())
+    except OSError:load=None
+    try:
+        disk=shutil.disk_usage('/mnt/kindle' if Path('/mnt/kindle/documents').is_dir() else Path.home())
+        storage={'total':disk.total,'used':disk.used}
+    except OSError:storage=None
+    tmux=shutil.which('tmux')
+    active=sessions(command([tmux,'list-sessions','-F','#{session_name}\t#{session_attached}\t#{session_windows}'])) if tmux else []
+    fm=Path('/usr/bin/fm').is_file() if system=='Darwin' else False
+    return dict(schema=1,observed_at=time.time(),hostname=platform.node()[:80],system=system,
+        cores=os.cpu_count() or 1,load=load,memory=memory,storage=storage,uptime=uptime,
+        battery=battery(),processes=process_watch(names),sessions=active,models=models(),
+        fm_installed=fm,work=queued_work())
+
+
+if __name__=='__main__':
+    print(json.dumps(snapshot(),separators=(',',':')))

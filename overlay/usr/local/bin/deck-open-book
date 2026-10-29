@@ -1,0 +1,65 @@
+#!/usr/bin/python3
+"""Index a delivered document, then hand it to the stock KPP reader."""
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+import urllib.parse
+import argparse
+
+NATIVE=['chroot','/proc/1/root']
+
+
+def native(command,timeout=5):
+    return subprocess.run(NATIVE+command,capture_output=True,text=True,timeout=timeout)
+
+
+def find_document(path):
+    schema=native(['/usr/bin/sqlite3','/var/local/cc.db','PRAGMA table_info(Entries);'])
+    columns=[line.split('|')[1] for line in schema.stdout.splitlines() if '|' in line]
+    names={c.lower():c for c in columns}
+    cde=names.get('p_cdekey');kind=names.get('p_cdetype')
+    paths=[c for c in columns if any(word in c.lower() for word in ('location','filepath','filename','documentpath'))]
+    if not cde or not kind or not paths:return None
+    def sql(value):return "'"+value.replace("'","''")+"'"
+    values={path,Path(path).name,urllib.parse.quote(path,safe='/'),urllib.parse.quote(Path(path).name)}
+    predicates=['instr("'+field+'",'+sql(value)+')>0' for field in paths for value in values]
+    query='SELECT "'+cde+'","'+kind+'" FROM Entries WHERE ('+' OR '.join(predicates)+') AND "'+cde+'" IS NOT NULL LIMIT 1;'
+    result=native(['/usr/bin/sqlite3','/var/local/cc.db',query])
+    for line in result.stdout.splitlines():
+        pieces=line.split('|')
+        if len(pieces)>=2 and pieces[0]:return {'asin':pieces[0],'type':pieces[1] or 'PDOC'}
+    return None
+
+
+def main():
+    parser=argparse.ArgumentParser();parser.add_argument('--index-only',action='store_true');parser.add_argument('path')
+    args=parser.parse_args();path=args.path
+    if not path.startswith('/mnt/us/documents/') or '..' in Path(path).parts:raise ValueError('This is not a Kindle library document.')
+    local=Path('/mnt/kindle')/Path(path).relative_to('/mnt/us')
+    if not local.is_file():raise ValueError('The delivered document is missing.')
+    native(['/usr/bin/lipc-set-prop','com.lab126.scanner','reScanFile',path])
+    info=None
+    for attempt in range(45):
+        info=find_document(path)
+        if info:break
+        if attempt==8:native(['/usr/bin/lipc-set-prop','com.lab126.scanner','doFullScan','1'])
+        time.sleep(1)
+    if not info:raise RuntimeError('Saved in your Kindle library. Indexing has not finished yet; try Read again shortly.')
+    if args.index_only:
+        print(json.dumps(info));return
+    Path('/mnt/kindle/linux/sleep-after-exit').unlink(missing_ok=True)
+    jwm=subprocess.run(['pidof','jwm'],capture_output=True,text=True).stdout.split()
+    pid=jwm[0] if jwm else '0'
+    payload=json.dumps(info,separators=(',',':'))
+    # Redirect after entering the native root, so no inherited log FD pins the chroot.
+    command='cd /; exec /bin/sh /mnt/us/linux/reader-handoff.sh "$@" </dev/null >>/mnt/us/linux/reader-open.log 2>&1'
+    subprocess.Popen(NATIVE+['/bin/sh','-c',command,'reader-handoff',pid,payload],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+    print('Opening in Kindle reader.',flush=True)
+    subprocess.Popen(['/bin/sh','-c','. /usr/local/bin/kindle-session-env; sleep 1; exec jwm -exit'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+
+
+if __name__=='__main__':
+    try:main()
+    except (OSError,ValueError,RuntimeError,subprocess.TimeoutExpired) as exc:print(str(exc),file=sys.stderr);sys.exit(1)

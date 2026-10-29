@@ -1,0 +1,4 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+kindle-keyboard hide >/dev/null 2>&1 || true
+exec /usr/local/bin/deck-home-ui "$@"

@@ -1,0 +1,936 @@
+#!/usr/bin/python3
+"""Field notes: a plain-text journal for the Kindle e-ink panel.
+
+Days are UTF-8 files named YYYY-MM-DD.txt. The on-screen keyboard always
+works. A USB keyboard is used only after this process grabs its event
+device, because the nested X server often never sees a keyboard that was
+plugged in late. The session owns the USB port: closing this page does
+not put it back. USB host mode on this Paperwhite is unproven.
+"""
+import array
+import datetime
+import fcntl
+import glob
+import os
+import pathlib
+import struct
+import subprocess
+import sys
+
+EV_KEY = 1
+EVIOCGRAB = (1 << 30) | (4 << 16) | (ord("E") << 8) | 0x90
+EVIOCGBIT_KEY = (2 << 30) | (96 << 16) | (ord("E") << 8) | 0x21
+EVIOCGNAME = (2 << 30) | (256 << 16) | (ord("E") << 8) | 0x06
+KEY_ENTER = 28
+KEY_A = 30
+SKIP_NAMES = (
+    "touch",
+    "goodix",
+    "mtk-tpd",
+    "zinitix",
+    "cypress",
+    "wacom",
+    "cyttsp",
+    "ilitek",
+    "focal",
+    "himax",
+    "gpio-keys",
+    "power",
+)
+
+# Linux keycode -> (unshifted, shifted). US QWERTY.
+SYMBOLS = {
+    2: ("1", "!"),
+    3: ("2", "@"),
+    4: ("3", "#"),
+    5: ("4", "$"),
+    6: ("5", "%"),
+    7: ("6", "^"),
+    8: ("7", "&"),
+    9: ("8", "*"),
+    10: ("9", "("),
+    11: ("0", ")"),
+    12: ("-", "_"),
+    13: ("=", "+"),
+    15: ("\t", "\t"),
+    26: ("[", "{"),
+    27: ("]", "}"),
+    28: ("\n", "\n"),
+    39: (";", ":"),
+    40: ("'", '"'),
+    41: ("`", "~"),
+    43: ("\\", "|"),
+    51: (",", "<"),
+    52: (".", ">"),
+    53: ("/", "?"),
+    55: ("*", "*"),
+    57: (" ", " "),
+    71: ("7", "7"),
+    72: ("8", "8"),
+    73: ("9", "9"),
+    74: ("-", "-"),
+    75: ("4", "4"),
+    76: ("5", "5"),
+    77: ("6", "6"),
+    78: ("+", "+"),
+    79: ("1", "1"),
+    80: ("2", "2"),
+    81: ("3", "3"),
+    82: ("0", "0"),
+    83: (".", "."),
+    86: ("<", ">"),
+    96: ("\n", "\n"),
+    98: ("/", "/"),
+}
+LETTERS = {
+    16: "q",
+    17: "w",
+    18: "e",
+    19: "r",
+    20: "t",
+    21: "y",
+    22: "u",
+    23: "i",
+    24: "o",
+    25: "p",
+    30: "a",
+    31: "s",
+    32: "d",
+    33: "f",
+    34: "g",
+    35: "h",
+    36: "j",
+    37: "k",
+    38: "l",
+    44: "z",
+    45: "x",
+    46: "c",
+    47: "v",
+    48: "b",
+    49: "n",
+    50: "m",
+}
+NAV = {
+    102: "home",
+    103: "up",
+    104: "pageup",
+    105: "left",
+    106: "right",
+    107: "end",
+    108: "down",
+    109: "pagedown",
+}
+MODS = {29: "ctrl", 97: "ctrl", 42: "shift", 54: "shift", 56: "alt", 100: "alt"}
+
+
+class Keys:
+    """US QWERTY state for one grabbed keyboard."""
+
+    def __init__(self):
+        self.ctrl = 0
+        self.shift = 0
+        self.alt = 0
+        self.caps = False
+
+    def event(self, code, value):
+        """value 0 release, 1 press, 2 repeat. Returns an action tuple."""
+        if code in MODS:
+            if value == 0:
+                name = MODS[code]
+                setattr(self, name, max(0, getattr(self, name) - 1))
+            elif value == 1:
+                name = MODS[code]
+                setattr(self, name, getattr(self, name) + 1)
+            return ("mod",)
+        if value == 0:
+            return ("ignore",)
+        if code == 58:
+            if value == 1:
+                self.caps = not self.caps
+            return ("caps",)
+        if self.ctrl:
+            if code == KEY_A:
+                return ("select-all",)
+            if code == 31:
+                return ("save",)
+            return ("ignore",)
+        if self.alt:
+            return ("ignore",)
+        if code == 14:
+            return ("backspace",)
+        if code == 111:
+            return ("delete",)
+        if code in NAV:
+            return ("move", NAV[code], self.shift > 0)
+        if code in LETTERS:
+            upper = self.shift > 0
+            if self.caps:
+                upper = not upper
+            ch = LETTERS[code]
+            return ("text", ch.upper() if upper else ch)
+        if code in SYMBOLS:
+            pair = SYMBOLS[code]
+            return ("text", pair[1] if self.shift > 0 else pair[0])
+        return ("ignore",)
+
+
+def heading_for(day):
+    return day.strftime("%A, %B ") + str(day.day)
+
+
+def body_words(text, heading):
+    """Count words after the date heading this editor writes."""
+    prefix = heading + "\n"
+    if text.startswith(prefix + "\n"):
+        body = text[len(prefix) + 1 :]
+    elif text.startswith(prefix):
+        body = text[len(prefix) :]
+    else:
+        body = text
+    return len(body.split())
+
+
+def unpack_events(blob, size):
+    fmt = "<IIHHi" if size == 16 else "<QQHHi"
+    step = struct.calcsize(fmt)
+    out = []
+    for off in range(0, len(blob) - step + 1, step):
+        _sec, _usec, typ, code, value = struct.unpack_from(fmt, blob, off)
+        out.append((typ, code, value))
+    return out
+
+
+def event_size_of(blob):
+    """16 bytes on this 32-bit kernel. 24 is accepted if that parse fails."""
+    if len(blob) >= 16 and _plausible(blob, 16):
+        return 16
+    if len(blob) >= 24 and _plausible(blob, 24):
+        return 24
+    return None
+
+
+def _plausible(blob, size):
+    fmt = "<IIHHi" if size == 16 else "<QQHHi"
+    _sec, _usec, typ, code, _value = struct.unpack_from(fmt, blob, 0)
+    return typ <= 31 and code <= 0x2FF
+
+
+def bit_set(bits, code):
+    if code < 0 or code // 8 >= len(bits):
+        return False
+    return bool(bits[code // 8] & (1 << (code % 8)))
+
+
+def choose_dir():
+    """Prefer the userstore so notes show up over USB."""
+    candidates = (
+        (
+            pathlib.Path("/mnt/kindle/journal"),
+            "",
+        ),
+        (
+            pathlib.Path("/home/alpine/journal"),
+            "Saved inside Alpine. It will not appear over USB.",
+        ),
+    )
+    for path, note in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write-test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except OSError:
+            continue
+        return path, note
+    raise SystemExit("No writable journal folder")
+
+
+def usb_log(line):
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    text = stamp + " " + line + "\n"
+    for path in ("/mnt/kindle/linux/usb-host.log", "/tmp/usb-host.log"):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(text)
+            return
+        except OSError:
+            continue
+
+
+def usb_up():
+    try:
+        proc = subprocess.run(
+            ["deck-usb-host", "up"],
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        usb_log("field-notes: deck-usb-host up failed: %s" % exc)
+        return "usb: switch failed"
+    line = ""
+    for part in (proc.stdout or "").splitlines():
+        part = part.strip()
+        if part.startswith("usb:"):
+            line = part
+    if proc.stderr:
+        usb_log("field-notes: deck-usb-host stderr: " + proc.stderr.strip()[:400])
+    if not line:
+        line = "usb: switch failed"
+    usb_log("field-notes: " + line)
+    return line
+
+
+USB_STATUS = {
+    "usb: no role file": "No USB host switch on this Kindle. On-screen keys still work.",
+    "usb: role file is read-only": "USB host switch is read-only. On-screen keys still work.",
+    "usb: switched to host": "USB port set to host. Plug the keyboard in, or use on-screen keys.",
+    "usb: already host": "USB port is already a host. Plug the keyboard in, or use on-screen keys.",
+    "usb: already switched": "USB port was already switched. Plug the keyboard in, or use on-screen keys.",
+    "usb: switch failed": "USB host switch failed. On-screen keys still work.",
+}
+
+
+def main():
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk
+
+    folder, place_note = choose_dir()
+
+    class Journal(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="field notes")
+            self.folder = folder
+            self.place_note = place_note
+            self.day = None
+            self.path = None
+            self.heading = ""
+            self.dirty = False
+            self.loading = False
+            self.words_dirty = True
+            self.usb_line = ""
+            self.usb_status = "On-screen keys."
+            self.hid_keyboard = False
+            self.followed_up = False
+            self.boards = {}
+            self.pending = {}
+            self.keys = {}
+            self.event_size = None
+            self.skip_ids = set()
+            self.logged_skip = set()
+            self.closing = False
+
+            self.set_decorated(False)
+            self.connect("delete-event", self._delete)
+            self.connect("destroy", self._destroy)
+
+            css = Gtk.CssProvider()
+            css.load_from_data(
+                b"""
+                window, box, scrolledwindow, viewport, textview, text {
+                    background: #ffffff;
+                    color: #141414;
+                }
+                #ornament {
+                    font-family: "Liberation Serif", "DejaVu Serif", "Noto Serif";
+                    font-size: 42px;
+                    color: #000000;
+                }
+                #status {
+                    font-family: "Liberation Sans", "DejaVu Sans", sans-serif;
+                    font-size: 26px;
+                    color: #000000;
+                }
+                button {
+                    font-family: "Liberation Sans", "DejaVu Sans", sans-serif;
+                    font-size: 30px;
+                    background: #ffffff;
+                    color: #000000;
+                    border: 3px solid #000000;
+                    border-radius: 0;
+                    padding: 10px 8px;
+                    min-height: 76px;
+                }
+                button:active { background: #000000; color: #ffffff; }
+                textview, textview text {
+                    font-family: "Liberation Serif", "DejaVu Serif", "Noto Serif";
+                    font-size: 48px;
+                    color: #141414;
+                    background: #ffffff;
+                    caret-color: #000000;
+                    -GtkTextView-cursor-aspect-ratio: 0.12;
+                }
+                """
+            )
+            Gtk.StyleContext.add_provider_for_screen(
+                self.get_screen(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            outer.set_margin_start(22)
+            outer.set_margin_end(18)
+            outer.set_margin_top(16)
+            outer.set_margin_bottom(12)
+            self.add(outer)
+
+            self.ornament = Gtk.Label(label="✶  field notes")
+            self.ornament.set_name("ornament")
+            self.ornament.set_xalign(0)
+            outer.pack_start(self.ornament, False, False, 0)
+
+            rule = Gtk.DrawingArea()
+            rule.set_size_request(-1, 3)
+            rule.connect("draw", self._paint_black)
+            outer.pack_start(rule, False, False, 0)
+
+            buttons = Gtk.Box(spacing=10)
+            buttons.set_homogeneous(True)
+            for label, handler in (
+                ("earlier", self._show_earlier),
+                ("today", self._go_today),
+                ("keys", self._toggle_keys),
+                ("close", self._close),
+            ):
+                button = Gtk.Button(label=label)
+                button.set_can_focus(False)
+                button.connect("clicked", handler)
+                buttons.pack_start(button, True, True, 0)
+            outer.pack_start(buttons, False, False, 0)
+
+            self.status = Gtk.Label(label="")
+            self.status.set_name("status")
+            self.status.set_xalign(0)
+            self.status.set_line_wrap(True)
+            outer.pack_start(self.status, False, False, 0)
+
+            self.stack = Gtk.Stack()
+            outer.pack_start(self.stack, True, True, 0)
+
+            page = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+            margin = Gtk.DrawingArea()
+            margin.set_size_request(4, -1)
+            margin.connect("draw", self._paint_black)
+            page.pack_start(margin, False, False, 0)
+
+            self.view = Gtk.TextView()
+            self.view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            self.view.set_left_margin(4)
+            self.view.set_right_margin(20)
+            self.view.set_top_margin(8)
+            self.view.set_bottom_margin(20)
+            self.view.set_pixels_above_lines(4)
+            self.view.set_pixels_below_lines(10)
+            self.view.set_cursor_visible(True)
+            self.buf = self.view.get_buffer()
+            self.buf.connect("changed", self._changed)
+            self.view.connect("key-press-event", self._x_key)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.add(self.view)
+            page.pack_start(scroller, True, True, 0)
+            self.stack.add_named(page, "write")
+
+            earlier = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            nav = Gtk.Box(spacing=10)
+            nav.set_homogeneous(True)
+            back = Gtk.Button(label="back")
+            back.set_can_focus(False)
+            back.connect("clicked", lambda *_a: self._show_write())
+            today = Gtk.Button(label="today")
+            today.set_can_focus(False)
+            today.connect("clicked", self._go_today)
+            nav.pack_start(back, True, True, 0)
+            nav.pack_start(today, True, True, 0)
+            earlier.pack_start(nav, False, False, 0)
+            self.earlier_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            earlier_scroll = Gtk.ScrolledWindow()
+            earlier_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            viewport = Gtk.Viewport()
+            viewport.add(self.earlier_list)
+            earlier_scroll.add(viewport)
+            earlier.pack_start(earlier_scroll, True, True, 0)
+            self.stack.add_named(earlier, "earlier")
+
+            self._fit()
+            self.open_day(datetime.date.today())
+            self.show_all()
+            self.present()
+            self.view.grab_focus()
+            GLib.idle_add(self._fit)
+            GLib.timeout_add(2000, self._autosave)
+            GLib.timeout_add(1200, self._refresh_words)
+            GLib.timeout_add(700, self._scan_keys)
+            GLib.timeout_add_seconds(8, self._usb_followup)
+            GLib.idle_add(self._start_usb)
+
+        def _paint_black(self, _widget, cr):
+            cr.set_source_rgb(0, 0, 0)
+            cr.paint()
+            return True
+
+        def _fit(self):
+            width, height = 1272, 1696
+            display = Gdk.Display.get_default()
+            if display is not None:
+                mon = display.get_primary_monitor()
+                if mon is None and display.get_n_monitors() > 0:
+                    mon = display.get_monitor(0)
+                if mon is not None:
+                    geom = mon.get_geometry()
+                    if geom.width > 100 and geom.height > 100:
+                        width, height = geom.width, geom.height
+            self.resize(width, max(400, height - 112))
+            self.move(0, 0)
+            return False
+
+        def _start_usb(self):
+            self.usb_line = usb_up()
+            self.usb_status = USB_STATUS.get(self.usb_line, self.usb_line)
+            if self.place_note:
+                self.usb_status = self.place_note + " " + self.usb_status
+            self._paint_status()
+            self._scan_keys()
+            return False
+
+        def _changed(self, _buf):
+            if self.loading:
+                return
+            self.dirty = True
+            self.words_dirty = True
+
+        def _text(self):
+            return self.buf.get_text(
+                self.buf.get_start_iter(), self.buf.get_end_iter(), True
+            )
+
+        def _paint_status(self):
+            words = body_words(self._text(), self.heading) if self.heading else 0
+            flag = "saved" if not self.dirty else "unsaved"
+            self.status.set_text(
+                "%s   ·   %d words   ·   %s\n%s"
+                % (self.heading, words, flag, self.usb_status)
+            )
+
+        def _refresh_words(self):
+            if self.words_dirty:
+                self.words_dirty = False
+                self._paint_status()
+            return True
+
+        def save(self):
+            if self.path is None or not self.dirty:
+                return True
+            text = self._text()
+            tmp = self.path.parent / (self.path.name + ".tmp")
+            try:
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, self.path)
+            except OSError as exc:
+                self.usb_status = "Could not save. %s" % exc
+                self._paint_status()
+                usb_log("field-notes: save failed: %s" % exc)
+                return False
+            self.dirty = False
+            self.words_dirty = False
+            self._paint_status()
+            return True
+
+        def _autosave(self):
+            if self.dirty:
+                self.save()
+            return True
+
+        def open_day(self, day):
+            if self.day == day and self.path is not None:
+                self.save()
+                self._show_write()
+                return
+            self.save()
+            self.day = day
+            self.heading = heading_for(day)
+            self.path = self.folder / (day.isoformat() + ".txt")
+            if self.path.exists():
+                try:
+                    text = self.path.read_text(encoding="utf-8")
+                except OSError as exc:
+                    text = self.heading + "\n\n"
+                    self.usb_status = "Could not open this day. %s" % exc
+            else:
+                text = self.heading + "\n\n"
+            self.loading = True
+            self.buf.set_text(text)
+            self.loading = False
+            end = self.buf.get_end_iter()
+            self.buf.place_cursor(end)
+            self.view.scroll_mark_onscreen(self.buf.get_insert())
+            self.dirty = not self.path.exists()
+            if self.dirty:
+                self.save()
+            else:
+                self._paint_status()
+            self._show_write()
+
+        def _show_write(self):
+            self.stack.set_visible_child_name("write")
+            self.view.grab_focus()
+
+        def _go_today(self, *_args):
+            self.open_day(datetime.date.today())
+
+        def _show_earlier(self, *_args):
+            self.save()
+            for child in list(self.earlier_list.get_children()):
+                self.earlier_list.remove(child)
+            files = sorted(self.folder.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].txt"))
+            files.reverse()
+            if not files:
+                empty = Gtk.Label(label="No earlier notes yet.")
+                empty.set_name("status")
+                empty.set_xalign(0)
+                self.earlier_list.pack_start(empty, False, False, 0)
+            for path in files:
+                try:
+                    day = datetime.date.fromisoformat(path.stem)
+                except ValueError:
+                    continue
+                label = heading_for(day)
+                if day == datetime.date.today():
+                    label += "    today"
+                button = Gtk.Button(label=label)
+                button.set_can_focus(False)
+                button.connect("clicked", lambda _b, d=day: self.open_day(d))
+                self.earlier_list.pack_start(button, False, False, 0)
+            self.earlier_list.show_all()
+            self.stack.set_visible_child_name("earlier")
+
+        def _toggle_keys(self, *_args):
+            subprocess.Popen(
+                ["kindle-keyboard", "toggle"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.view.grab_focus()
+
+        def _x_key(self, _widget, event):
+            # On-screen keys arrive here. Swallow Ctrl+Q so the page stays open.
+            if event.state & Gdk.ModifierType.CONTROL_MASK:
+                if event.keyval in (Gdk.KEY_q, Gdk.KEY_Q):
+                    return True
+                if event.keyval in (Gdk.KEY_s, Gdk.KEY_S):
+                    self.save()
+                    return True
+            return False
+
+        def _insert(self, text):
+            if self.buf.get_has_selection():
+                self.buf.delete_selection(True, True)
+            self.buf.insert_at_cursor(text)
+            self.view.scroll_mark_onscreen(self.buf.get_insert())
+
+        def _backspace(self):
+            if self.buf.get_has_selection():
+                self.buf.delete_selection(True, True)
+                return
+            end = self.buf.get_iter_at_mark(self.buf.get_insert())
+            start = end.copy()
+            if start.backward_char():
+                self.buf.delete(start, end)
+
+        def _delete_forward(self):
+            if self.buf.get_has_selection():
+                self.buf.delete_selection(True, True)
+                return
+            start = self.buf.get_iter_at_mark(self.buf.get_insert())
+            end = start.copy()
+            if end.forward_char():
+                self.buf.delete(start, end)
+
+        def _move(self, kind, select):
+            insert = self.buf.get_iter_at_mark(self.buf.get_insert())
+            bound = self.buf.get_iter_at_mark(self.buf.get_selection_bound())
+            if kind == "left":
+                insert.backward_char()
+            elif kind == "right":
+                insert.forward_char()
+            elif kind == "home":
+                insert.set_line_offset(0)
+            elif kind == "end":
+                insert.forward_to_line_end()
+            elif kind in ("up", "down", "pageup", "pagedown"):
+                offset = insert.get_line_offset()
+                steps = 8 if kind in ("pageup", "pagedown") else 1
+                moved = False
+                for _i in range(steps):
+                    if kind in ("up", "pageup"):
+                        moved = insert.backward_line() or moved
+                    else:
+                        moved = insert.forward_line() or moved
+                    if not moved:
+                        break
+                if moved:
+                    room = max(0, insert.get_chars_in_line() - 1)
+                    insert.set_line_offset(min(offset, room))
+            if select:
+                self.buf.select_range(insert, bound)
+            else:
+                self.buf.place_cursor(insert)
+            self.view.scroll_mark_onscreen(self.buf.get_insert())
+
+        def _apply_key(self, board, code, value):
+            action = board.event(code, value)
+            kind = action[0]
+            if kind == "text":
+                self._insert(action[1])
+            elif kind == "backspace":
+                self._backspace()
+            elif kind == "delete":
+                self._delete_forward()
+            elif kind == "move":
+                self._move(action[1], action[2])
+            elif kind == "save":
+                self.save()
+            elif kind == "select-all":
+                self.buf.select_range(self.buf.get_start_iter(), self.buf.get_end_iter())
+
+        def _scan_keys(self):
+            for path in sorted(glob.glob("/dev/input/event*")):
+                if path in self.boards:
+                    continue
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                ident = (st.st_rdev, st.st_ino)
+                if ident in self.skip_ids:
+                    continue
+                self._consider(path, ident)
+            return True
+
+        def _consider(self, path, ident):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            except OSError as exc:
+                if ident not in self.logged_skip:
+                    usb_log("field-notes: open %s failed: %s" % (path, exc))
+                    self.logged_skip.add(ident)
+                self.skip_ids.add(ident)
+                return
+            name = self._device_name(fd)
+            lowered = name.lower()
+            if any(part in lowered for part in SKIP_NAMES):
+                os.close(fd)
+                self.skip_ids.add(ident)
+                return
+            bits = array.array("B", [0] * 96)
+            try:
+                fcntl.ioctl(fd, EVIOCGBIT_KEY, bits, True)
+            except OSError as exc:
+                os.close(fd)
+                self.skip_ids.add(ident)
+                usb_log("field-notes: key bitmap %s failed: %s" % (path, exc))
+                return
+            if not (bit_set(bits, KEY_A) and bit_set(bits, KEY_ENTER)):
+                os.close(fd)
+                self.skip_ids.add(ident)
+                return
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 1)
+            except OSError as exc:
+                os.close(fd)
+                self.skip_ids.add(ident)
+                usb_log("field-notes: could not grab %s (%s): %s" % (path, name, exc))
+                self.usb_status = (
+                    "A keyboard appeared, but this page could not take it. "
+                    "On-screen keys still work."
+                )
+                self._paint_status()
+                return
+            self.boards[path] = fd
+            self.pending[fd] = b""
+            self.keys[fd] = Keys()
+            GLib.io_add_watch(
+                fd,
+                GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+                self._on_ev,
+            )
+            usb_log("field-notes: grabbed %s name=%s" % (path, name))
+            self.usb_status = "USB keyboard ready."
+            self._paint_status()
+            if not self.hid_keyboard:
+                self.hid_keyboard = True
+                subprocess.Popen(
+                    ["kindle-keyboard", "hide"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+        def _device_name(self, fd):
+            buf = array.array("B", [0] * 256)
+            try:
+                fcntl.ioctl(fd, EVIOCGNAME, buf, True)
+            except OSError:
+                return ""
+            return buf.tobytes().split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+        def _on_ev(self, fd, condition):
+            if fd not in self.pending:
+                return False
+            if condition & (GLib.IO_HUP | GLib.IO_ERR):
+                self._drop_fd(fd)
+                return False
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                return True
+            except OSError:
+                self._drop_fd(fd)
+                return False
+            if not data:
+                self._drop_fd(fd)
+                return False
+            blob = self.pending.get(fd, b"") + data
+            size = self.event_size
+            if size is None:
+                size = event_size_of(blob)
+                if size is None:
+                    self.pending[fd] = blob[-24:]
+                    return True
+                self.event_size = size
+                usb_log("field-notes: input event size %d" % size)
+            whole = len(blob) - (len(blob) % size)
+            self.pending[fd] = blob[whole:]
+            board = self.keys.get(fd)
+            if board is None:
+                return True
+            for typ, code, value in unpack_events(blob[:whole], size):
+                if typ == EV_KEY:
+                    self._apply_key(board, code, value)
+            return True
+
+        def _drop_fd(self, fd):
+            path = None
+            for candidate, held in list(self.boards.items()):
+                if held == fd:
+                    path = candidate
+                    break
+            if path is not None:
+                del self.boards[path]
+            self.pending.pop(fd, None)
+            self.keys.pop(fd, None)
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 0)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            usb_log("field-notes: released %s" % (path or fd))
+            if not self.boards and not self.closing:
+                self.usb_status = "USB keyboard unplugged. On-screen keys are back."
+                self._paint_status()
+                if self.hid_keyboard:
+                    subprocess.Popen(
+                        ["kindle-keyboard", "show"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+
+        def _usb_followup(self):
+            if self.followed_up or self.boards:
+                return False
+            self.followed_up = True
+            if self.usb_line in ("usb: switched to host", "usb: already host", "usb: already switched"):
+                self.usb_status = (
+                    "No keyboard yet. The log is linux/usb-host.log. "
+                    "A powered hub is the next try."
+                )
+                if self.place_note:
+                    self.usb_status = self.place_note + " " + self.usb_status
+                self._paint_status()
+                usb_log("field-notes: no keyboard 8s after the host probe")
+            return False
+
+        def _release_all(self):
+            for fd in list(self.pending):
+                self._drop_fd(fd)
+
+        def _delete(self, *_args):
+            self._close()
+            return True
+
+        def _destroy(self, *_args):
+            Gtk.main_quit()
+
+        def _close(self, *_args):
+            if self.closing:
+                return
+            self.closing = True
+            self.save()
+            self._release_all()
+            if self.hid_keyboard:
+                subprocess.call(
+                    ["kindle-keyboard", "show"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self.destroy()
+
+    win = Journal()
+    Gtk.main()
+    return 0
+
+
+def self_test():
+    assert EVIOCGRAB == 0x40044590
+    assert EVIOCGBIT_KEY == 0x80604521
+    assert EVIOCGNAME == 0x81004506
+    day = datetime.date(2026, 10, 25)
+    assert heading_for(day) == "Sunday, October 25"
+    assert body_words("Sunday, October 25\n\nhello world\n", heading_for(day)) == 2
+    assert body_words("Sunday, October 25\n\n", heading_for(day)) == 0
+    assert body_words("no heading here today", heading_for(day)) == 4
+    blob = struct.pack("<IIHHi", 10, 20, EV_KEY, KEY_A, 1)
+    assert unpack_events(blob, 16) == [(EV_KEY, KEY_A, 1)]
+    assert event_size_of(blob) == 16
+    bits = array.array("B", [0] * 96)
+    bits[KEY_A // 8] |= 1 << (KEY_A % 8)
+    assert bit_set(bits, KEY_A)
+    assert not bit_set(bits, KEY_ENTER)
+
+    keys = Keys()
+    assert keys.event(KEY_A, 1) == ("text", "a")
+    assert keys.event(KEY_A, 2) == ("text", "a")
+    assert keys.event(KEY_A, 0) == ("ignore",)
+    assert keys.event(42, 1) == ("mod",)
+    assert keys.event(KEY_A, 1) == ("text", "A")
+    assert keys.event(2, 1) == ("text", "!")
+    keys.caps = True
+    assert keys.event(KEY_A, 1) == ("text", "a")
+    keys.event(42, 0)
+    assert keys.event(KEY_A, 1) == ("text", "A")
+    keys.caps = False
+    assert keys.event(28, 1) == ("text", "\n")
+    assert keys.event(14, 1) == ("backspace",)
+    assert keys.event(103, 1)[0:2] == ("move", "up")
+    assert keys.event(103, 1)[2] is False
+    keys.event(42, 1)
+    assert keys.event(105, 1) == ("move", "left", True)
+    keys.event(42, 0)
+    assert keys.event(29, 1) == ("mod",)
+    assert keys.event(31, 1) == ("save",)
+    assert keys.event(16, 1) == ("ignore",)
+    assert keys.event(KEY_A, 1) == ("select-all",)
+    keys.event(29, 0)
+    assert keys.ctrl == 0
+    print("field-notes self-test ok")
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        raise SystemExit(self_test())
+    raise SystemExit(main())

@@ -1,0 +1,187 @@
+#!/usr/bin/python3
+"""A touch-first home screen for the Kindle's existing cyberdeck tools."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+import gi
+gi.require_version('Gtk','3.0')
+from gi.repository import Gtk, Gdk, Gio, GLib, Pango
+
+ROOT=Path('/mnt/kindle')
+CSS=b'''
+window {background:#fff;color:#111;font:32px "DejaVu Sans";}
+button {min-height:72px;padding:16px 12px;border:3px solid #111;border-radius:0;background:#fff;color:#111;}
+button:active {background:#111;color:#fff;}
+button.suggested-action {background:#111;color:#fff;}
+label.heading {font-size:48px;font-weight:bold;}
+label.subtitle {font-size:26px;}
+entry {min-height:72px;padding:12px;border:3px solid #111;}
+scrollbar slider {min-width:48px;min-height:64px;background:#444;}
+'''
+
+
+def swipe(scroller):
+    gesture=Gtk.GestureDrag.new(scroller)
+    gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    state={}
+    def start(g,x,y):
+        state['value']=scroller.get_vadjustment().get_value();state['claimed']=False
+    def move(g,x,y):
+        if abs(y)>18:
+            g.set_state(Gtk.EventSequenceState.CLAIMED);state['claimed']=True
+            scroller.get_vadjustment().set_value(state.get('value',0)-y)
+    gesture.connect('drag-begin',start);gesture.connect('drag-update',move)
+    scroller._swipe=gesture
+
+
+class Home(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id='org.cyberdeck.TouchHome',flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.window=None;self.page='home'
+
+    def do_command_line(self,command_line):
+        args=command_line.get_arguments();self.activate()
+        if len(args)>1 and args[1]=='windows':self.show('windows')
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.present();return
+        self.window=Gtk.ApplicationWindow(application=self,title='Cyberdeck Home')
+        self.window.set_wmclass('deck-home','CyberdeckHome')
+        self.window.set_default_size(1000,1300)
+        self.window.connect('delete-event',self.close)
+        css=Gtk.CssProvider();css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(self.window.get_screen(),css,600)
+        outer=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=14)
+        outer.set_border_width(22);self.window.add(outer)
+        header=Gtk.Box(spacing=16)
+        self.back=self.button('Back',lambda:self.show('home'))
+        header.pack_start(self.back,False,False,0)
+        self.heading=Gtk.Label(label='Cyberdeck');self.heading.get_style_context().add_class('heading')
+        self.heading.set_xalign(0);header.pack_start(self.heading,True,True,0)
+        header.pack_start(self.button('Art',self.art),False,False,0)
+        outer.pack_start(header,False,False,0)
+        self.scroll=Gtk.ScrolledWindow();self.scroll.set_policy(Gtk.PolicyType.NEVER,Gtk.PolicyType.AUTOMATIC)
+        swipe(self.scroll)
+        self.content=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=14)
+        self.scroll.add(self.content);outer.pack_start(self.scroll,True,True,0)
+        self.status=Gtk.Label(label='Tap a tile. Swipe lists to scroll.');self.status.get_style_context().add_class('subtitle')
+        self.status.set_line_wrap(True);outer.pack_start(self.status,False,False,0)
+        footer=Gtk.Box(spacing=12);footer.set_homogeneous(True)
+        for label,action in [('Keyboard',lambda:self.launch(['kindle-keyboard','toggle'])),('Terminal',lambda:self.launch(['kindle-terminal'])),('Kindle',self.exit_options)]:
+            footer.pack_start(self.button(label,action),True,True,0)
+        outer.pack_start(footer,False,False,0)
+        self.show('home');self.window.show_all();self.window.maximize()
+
+    def button(self,label,action):
+        b=Gtk.Button(label=label);b.set_can_focus(False)
+        child=b.get_child();child.set_line_wrap(True);child.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR);child.set_max_width_chars(22)
+        b.connect('clicked',lambda _b:action());return b
+
+    def launch(self,command,terminal=False,title='Cyberdeck'):
+        if terminal: command=['kindle-terminal','-T',title,'-e']+command
+        env=os.environ.copy();env.pop('WINDOWID',None)
+        try:
+            with open('/mnt/kindle/linux/launcher.log','ab',buffering=0) as log:
+                subprocess.Popen(command,stdout=log,stderr=log,env=env,start_new_session=True)
+            self.status.set_text('Opened '+title+'. Close its window to return.')
+            if terminal or command[0] in {'kindle-terminal','deck-web','deck-gb','deck-chess','deck-instruments','field-notes','deck-display'}:self.window.hide()
+        except OSError as exc:self.status.set_text(str(exc))
+
+    def art(self):
+        self.launch(['artgen','show-latest'],title='Art Mode');self.window.hide()
+        # Home remains reachable from the desktop tray; art's Back closes the view.
+        self.quit()
+
+    def close(self,*_):
+        self.quit();return False
+
+    def clear(self,title):
+        for child in self.content.get_children():self.content.remove(child)
+        self.heading.set_text(title);self.scroll.get_vadjustment().set_value(0)
+
+    def tiles(self,items):
+        grid=Gtk.Grid(column_spacing=14,row_spacing=14);grid.set_column_homogeneous(True)
+        for i,(label,action) in enumerate(items):
+            b=self.button(label,action);b.set_hexpand(True);grid.attach(b,i%2,i//2,1,1)
+        self.content.pack_start(grid,False,False,0)
+
+    def show(self,page):
+        self.page=page;self.clear({'home':'Cyberdeck','personal':'Personal','games':'Games','dev':'Dev','settings':'Settings'}.get(page,page))
+        self.back.set_sensitive(page!='home')
+        app=lambda label,cmd,term=False:(label,lambda:self.launch(cmd,term,label))
+        if page=='home':
+            self.tiles([(label,lambda p=p:self.show(p)) for p,label in [('personal','Personal'),('games','Games'),('dev','Dev'),('settings','Settings')]])
+            self.tiles([app('Instrument panel',['deck-instruments']),('Art Mode',self.art),app('Browser',['deck-web','home']),('Open windows',lambda:self.show('windows'))])
+        elif page=='personal':
+            self.tiles([app('Chat',['deck-web','chat']),app('Archive / Magazines',['deck-web','archive']),app('Books',['deck-books'],True),app('Journal',['field-notes']),('Files',lambda:self.files(ROOT)),('Art Mode',self.art)])
+        elif page=='games':
+            self.tiles([app('Pokémon Red',['deck-gb','pokemon-red']),app('Game Boy library',['deck-gb','pick'],True),app('Lichess · Online chess',['deck-chess','--lichess']),app('Chess · Offline',['deck-chess']),app('Joy-Con setup',['cyberdeck'],True)])
+        elif page=='dev':
+            self.tiles([app('Instrument panel',['deck-instruments'])])
+            self.tiles([app('Local terminal',['kindle-terminal']),app('MacBook shell',['deck-connect','mac','kindle'],True),app('Omarchy shell',['deck-connect','omarchy','kindle'],True),app('Mac FM AI',['deck-mac-ai','fm'],True),app('Mac local AI',['deck-mac-ai','local'],True),app('Codex',['deck-connect','omarchy','codex','exec codex'],True),app('OpenCode',['deck-connect','omarchy','opencode','exec opencode'],True),app('Grok',['deck-connect','omarchy','grok','exec grok'],True),app('Omarchy screen',['deck-display'])])
+        elif page=='settings':
+            self.tiles([('Portrait',lambda:self.launch(['deck-orientation','portrait'])),('Landscape left',lambda:self.launch(['deck-orientation','left'])),('Landscape right',lambda:self.launch(['deck-orientation','right'])),('Keyboard',lambda:self.launch(['kindle-keyboard','toggle']))])
+            self.content.pack_start(Gtk.Label(label='Terminal font size'),False,False,10)
+            self.tiles([(str(n),lambda n=n:self.launch(['kindle-font',str(n)])) for n in (18,22,26,30)])
+            self.tiles([('Daily art background',self.enable_art),('Disable art',lambda:self.launch(['artgen','disable'])),app('Connection / SSH tools',['cyberdeck'],True),app('Text menu',['cyberdeck'],True)])
+        elif page=='windows':
+            self.heading.set_text('Open windows')
+            import re
+            listing=subprocess.run(['xprop','-root','_NET_CLIENT_LIST'],capture_output=True,text=True).stdout
+            for window in re.findall(r'0x[0-9a-fA-F]+',listing):
+                props=subprocess.run(['xprop','-id',window,'_NET_WM_NAME','WM_NAME','WM_CLASS','_NET_WM_WINDOW_TYPE'],capture_output=True,text=True).stdout
+                if any(tag in props for tag in ('Onboard','CyberdeckHome','_NET_WM_WINDOW_TYPE_DESKTOP','_NET_WM_WINDOW_TYPE_DOCK')):continue
+                match=re.search(r'(?:_NET_WM_NAME|WM_NAME).*?= "(.*?)"',props)
+                title=match[1] if match else window
+                self.content.pack_start(self.button(title,lambda w=window:self.focus(w)),False,False,0)
+        self.content.show_all()
+
+    def focus(self,window):
+        subprocess.Popen(['xdotool','windowactivate',window]);self.window.hide()
+
+    def enable_art(self):
+        self.launch(['artgen','set-background','--latest']);self.status.set_text('Art background enabled. Close Home or Terminal to reveal it.')
+
+    def files(self,path):
+        path=Path(path).resolve()
+        if path!=ROOT and ROOT not in path.parents:path=ROOT
+        self.clear('Files');self.back.set_sensitive(True)
+        self.content.pack_start(Gtk.Label(label=str(path)),False,False,0)
+        if path!=ROOT:self.content.pack_start(self.button('Up one folder',lambda:self.files(path.parent)),False,False,0)
+        try:
+            children=sorted(path.iterdir(),key=lambda p:(not p.is_dir(),p.name.casefold()))
+            for child in children[:200]:
+                label=('Folder · ' if child.is_dir() else '')+child.name
+                self.content.pack_start(self.button(label,lambda p=child:self.files(p) if p.is_dir() else self.file_info(p)),False,False,0)
+        except OSError as exc:self.content.pack_start(Gtk.Label(label=str(exc)),False,False,0)
+        self.content.show_all()
+
+    def file_info(self,path):
+        dialog=Gtk.Dialog(title=path.name,transient_for=self.window,modal=True)
+        dialog.set_default_size(900,700);dialog.add_button('Back',Gtk.ResponseType.CLOSE)
+        area=dialog.get_content_area();area.set_border_width(20)
+        if path.suffix.lower() in {'.txt','.md','.log','.json','.sh','.csv'} and path.stat().st_size<=512000:
+            view=Gtk.TextView();view.set_editable(False);view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            view.get_buffer().set_text(path.read_text(errors='replace'))
+            scroll=Gtk.ScrolledWindow();scroll.add(view);swipe(scroll);area.pack_start(scroll,True,True,0)
+        else:
+            label=Gtk.Label(label=str(path)+'\n\n'+str(path.stat().st_size)+' bytes');label.set_line_wrap(True);area.pack_start(label,True,True,0)
+        dialog.connect('response',lambda d,*_:d.destroy());dialog.show_all()
+
+    def exit_options(self):
+        dialog=Gtk.Dialog(title='Return to Kindle',transient_for=self.window,modal=True)
+        dialog.set_default_size(900,400)
+        text=Gtk.Label(label='Return to the Kindle reader, or return and sleep.');text.set_line_wrap(True)
+        dialog.get_content_area().pack_start(text,True,True,20)
+        for label,response in [('Stay here',0),('Kindle reader',1),('Sleep Kindle',2)]:dialog.add_button(label,response)
+        def selected(d,response):
+            d.destroy()
+            if response in (1,2):self.launch(['deck-exit','sleep' if response==2 else 'reader'])
+        dialog.connect('response',selected);dialog.show_all()
+
+
+if __name__=='__main__':
+    app=Home();raise SystemExit(app.run(sys.argv))

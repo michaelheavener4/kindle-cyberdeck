@@ -1,0 +1,30 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+unset GTK_MODULES
+
+dimensions=$(xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2; exit}')
+screen_width=${dimensions%x*}
+screen_height=${dimensions#*x}
+case "$screen_width:$screen_height" in
+  *[!0-9:]*|:|*:) screen_width=1272; screen_height=1696 ;;
+esac
+keyboard_height=$((screen_height * 30 / 100))
+[ "$keyboard_height" -ge 360 ] || keyboard_height=360
+[ "$keyboard_height" -le 520 ] || keyboard_height=520
+for orientation in portrait landscape; do
+  if [ "$screen_width" -gt "$screen_height" ]; then long=$screen_width; short=$screen_height; else long=$screen_height; short=$screen_width; fi
+  if [ "$orientation" = portrait ]; then edge_size=$long; else edge_size=$short; fi
+  dock_height=$((edge_size * 30 / 100))
+  [ "$dock_height" -ge 360 ] || dock_height=360
+  [ "$dock_height" -le 520 ] || dock_height=520
+  gsettings set "org.onboard.window.$orientation" dock-height "$dock_height"
+  gsettings set "org.onboard.window.$orientation" dock-width "$screen_width"
+  gsettings set "org.onboard.window.$orientation" dock-expand true
+done
+gsettings set org.onboard.window docking-edge bottom
+gsettings set org.onboard.window docking-shrink-workarea true
+gsettings set org.onboard.window docking-enabled true
+gsettings set org.onboard start-minimized true
+
+# Explicit -x/-y disables Onboard's docking, including work-area struts.
+exec onboard --layout=Compact --theme=HighContrast

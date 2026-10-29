@@ -1,0 +1,407 @@
+#!/usr/bin/python3
+"""Original deterministic, one-bit compositions for the Kindle cyberdeck."""
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import random
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from zoneinfo import ZoneInfo
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+MODES = ('lsystem_flower', 'branching_tree', 'geometric_grid', 'line_field',
+         'ink_gesture', 'ascii_poem', 'conceptual_text', 'topology_map', 'rule_drawing')
+ROOT = Path('/mnt/kindle/art') if Path('/mnt/kindle').is_dir() else Path.home()/'.local/share/cyberdeck-art'
+TAU = math.tau
+
+
+def seed_number(value):
+    try: return int(value)
+    except (TypeError, ValueError): return int.from_bytes(hashlib.sha256(str(value).encode()).digest()[:8], 'big')
+
+
+def local_day():
+    try:
+        config=json.loads((ROOT/'config.json').read_text())
+        return dt.datetime.now(ZoneInfo(config.get('timezone','UTC'))).date()
+    except (OSError, ValueError, KeyError): return dt.date.today()
+
+
+def size_auto():
+    try:
+        result=subprocess.run(['xdpyinfo'],capture_output=True,text=True,timeout=2)
+        import re
+        match=re.search(r'dimensions:\s+(\d+)x(\d+)',result.stdout)
+        if match: return tuple(map(int,match.groups()))
+    except (OSError,subprocess.TimeoutExpired): pass
+    return 1272,1696
+
+
+def font(size,mono=False):
+    candidates=['/usr/share/fonts/ttf-dejavu/DejaVuSansMono.ttf' if mono else '/usr/share/fonts/ttf-dejavu/DejaVuSerif.ttf',
+                '/usr/share/fonts/dejavu/DejaVuSansMono.ttf' if mono else '/usr/share/fonts/dejavu/DejaVuSerif.ttf']
+    for name in candidates:
+        try: return ImageFont.truetype(name,size)
+        except OSError: pass
+    return ImageFont.load_default(size=size)
+
+
+class Drawing:
+    def __init__(self,width,height,seed,density=1,stroke=2,complexity=5,spacing=1,symmetry=1,invert=False,text=''):
+        self.w,self.h=width,height
+        self.r=random.Random(seed)
+        self.image=Image.new('1',(width,height),1)
+        self.d=ImageDraw.Draw(self.image)
+        self.unit=min(width,height)/1000
+        self.stroke=max(1,round(stroke*self.unit))
+        self.density=density; self.complexity=complexity
+        self.spacing=spacing; self.symmetry=symmetry; self.invert=invert; self.text=text
+
+    def line(self,points,width=None):
+        self.d.line(points,fill=0,width=width or self.stroke,joint='curve')
+
+    def leaf(self,x,y,angle,length):
+        ux,uy=math.cos(angle),math.sin(angle)
+        nx,ny=-uy,ux
+        self.d.polygon([(x,y),(x+ux*length*.45+nx*length*.22,y+uy*length*.45+ny*length*.22),
+                        (x+ux*length,y+uy*length),(x+ux*length*.45-nx*length*.22,y+uy*length*.45-ny*length*.22)],fill=0)
+
+    def flower(self,x,y,angle,radius):
+        for n in range(5):
+            a=angle+TAU*n/5
+            px,py=x+math.cos(a)*radius*.7,y+math.sin(a)*radius*.7
+            self.d.ellipse((px-radius*.35,py-radius*.35,px+radius*.35,py+radius*.35),outline=0,width=self.stroke)
+        self.d.ellipse((x-radius*.12,y-radius*.12,x+radius*.12,y+radius*.12),fill=0)
+
+    def lsystem_flower(self):
+        # A bounded recursive grammar: grow a stem, alternate leaves, then branch.
+        def grow(x,y,a,length,depth):
+            if depth<=0 or length<5*self.unit:
+                self.flower(x,y,a,11*self.unit); return
+            bend=self.r.uniform(-.13,.13)
+            points=[]
+            for i in range(7):
+                t=i/6; aa=a+bend*t
+                points.append((x+math.cos(aa)*length*t,y+math.sin(aa)*length*t))
+            self.line(points,max(1,round(self.stroke*(.5+depth*.15))))
+            ex,ey=points[-1]
+            if self.r.random()<min(1,self.density*.7):
+                lx,ly=points[3]; self.leaf(lx,ly,a+(-1 if depth%2 else 1)*.75,length*.30)
+            for offset in (-.47,.43): grow(ex,ey,a+offset+self.r.uniform(-.08,.08),length*.71,depth-1)
+        count=max(1,min(3,round(self.density)))
+        for i in range(count):
+            x=self.w*(.5+(i-(count-1)/2)*.24)
+            grow(x,self.h*.83,-math.pi/2+self.r.uniform(-.12,.12),self.h*.14/(count**.25),min(8,self.complexity))
+        self.line([(self.w*.15,self.h*.86),(self.w*.84,self.h*.86)],max(1,self.stroke//2))
+
+    def branching_tree(self):
+        def branch(x,y,a,length,depth):
+            end=(x+math.cos(a)*length,y+math.sin(a)*length)
+            self.line([(x,y),end],max(1,round(self.stroke*depth*.35)))
+            if depth<=1:
+                if self.r.random()<self.density*.55: self.leaf(*end,a,12*self.unit)
+                return
+            spread=.26+self.r.random()*.30
+            for sign in (-1,1): branch(*end,a+sign*spread,length*self.r.uniform(.62,.78),depth-1)
+        branch(self.w*.5,self.h*.86,-math.pi/2,self.h*.19,min(9,self.complexity+1))
+        self.d.ellipse((self.w*.2,self.h*.87,self.w*.8,self.h*.89),outline=0,width=self.stroke)
+
+    def geometric_grid(self):
+        step=max(45*self.unit,120*self.unit*self.spacing/(self.density**.5))
+        columns=max(2,int(self.w*.75/step));rows=max(2,int(self.h*.68/step))
+        left=(self.w-columns*step)/2;top=(self.h-rows*step)/2
+        for row in range(rows):
+            for col in range(columns):
+                x=left+(col+.5)*step;y=top+(row+.5)*step;r=step*.32
+                key=abs(col-columns//2) if self.symmetry>1 else col
+                choice=random.Random(seed_number(f'{self.r.random():.5f}-{row}-{key}')).randrange(5)
+                if choice==0: continue
+                if choice==1: self.d.ellipse((x-r,y-r,x+r,y+r),outline=0,width=self.stroke)
+                elif choice==2: self.d.rectangle((x-r,y-r,x+r,y+r),outline=0,width=self.stroke)
+                elif choice==3: self.line([(x-r,y+r),(x+r,y-r)])
+                else:
+                    self.line([(x-r,y),(x+r,y)])
+                    self.line([(x,y-r),(x,y+r)])
+
+    def line_field(self):
+        step=max(18*self.unit,42*self.unit*self.spacing/self.density)
+        centers=[(self.r.uniform(.25,.75)*self.w,self.r.uniform(.3,.7)*self.h,self.r.choice([-1,1])) for _ in range(2+self.complexity//2)]
+        y=self.h*.13
+        while y<self.h*.87:
+            x=self.w*.12
+            while x<self.w*.88:
+                angle=0
+                for cx,cy,sign in centers: angle+=sign*math.atan2(y-cy,x-cx)
+                length=step*.57
+                self.line([(x-math.cos(angle)*length/2,y-math.sin(angle)*length/2),(x+math.cos(angle)*length/2,y+math.sin(angle)*length/2)])
+                x+=step
+            y+=step
+
+    def ink_gesture(self):
+        for _ in range(max(3,round(self.complexity*self.density*1.5))):
+            x=self.r.uniform(.22,.78)*self.w;y=self.r.uniform(.2,.8)*self.h
+            angle=self.r.uniform(0,TAU);points=[(x,y)]
+            length=self.r.uniform(.16,.44)*min(self.w,self.h)
+            for i in range(45):
+                angle+=self.r.uniform(-.12,.12)
+                x+=math.cos(angle)*length/45;y+=math.sin(angle)*length/45
+                points.append((x,y))
+            for i in range(len(points)-1):
+                width=max(1,round(self.stroke*(1+5*math.sin(math.pi*i/len(points))**2)))
+                self.line(points[i:i+2],width)
+
+    def ascii_poem(self):
+        size=max(15,round(24*self.unit*self.spacing));f=font(size,True)
+        step_x=max(8,f.getlength('M'));step_y=size*1.4
+        cols=max(8,int(self.w*.74/step_x));rows=max(8,int(self.h*.62/step_y))
+        chars=' .,:;+*#'
+        for row in range(rows):
+            line=''
+            for col in range(cols):
+                x=(col-cols/2)/cols*4;y=(row-rows/2)/rows*4
+                value=math.sin(x*x-y*y+self.r.uniform(-.2,.2))+math.cos(x*y*2)
+                index=max(0,min(7,int((value+2)*1.8*self.density)))
+                line+=chars[index]
+            self.d.text(((self.w-cols*step_x)/2,(self.h-rows*step_y)/2+row*step_y),line,font=f,fill=0)
+        words=self.text or 'a small weather / inside the quiet'
+        self.d.text((self.w*.13,self.h*.86),words[:80],font=font(round(25*self.unit),True),fill=0)
+
+    def conceptual_text(self):
+        words=self.text or self.r.choice(['LEAVE ROOM\nFOR WHAT\nIS NOT YET HERE','ONE LINE\nTHEN\nANOTHER','THE SPACE\nBETWEEN\nTWO THOUGHTS'])
+        lines=words.replace(' / ','\n').splitlines()[:8]
+        size=round(65*self.unit)
+        while size>14 and max(font(size).getlength(line) for line in lines)>self.w*.74: size-=2
+        f=font(size);leading=size*1.6;top=(self.h-leading*len(lines))/2
+        for i,line in enumerate(lines): self.d.text(((self.w-f.getlength(line))/2,top+i*leading),line,font=f,fill=0)
+        self.line([(self.w*.42,self.h*.78),(self.w*.58,self.h*.78)])
+
+    def topology_map(self):
+        cx=self.w*self.r.uniform(.42,.58);cy=self.h*self.r.uniform(.42,.58)
+        rings=max(8,min(65,round((10+self.complexity*3)*self.density/self.spacing)))
+        phases=[self.r.uniform(0,TAU) for _ in range(4)]
+        for ring in range(rings):
+            radius=min(self.w,self.h)*(.05+.32*ring/rings)
+            points=[]
+            for i in range(241):
+                a=TAU*i/240
+                wave=1+sum(.06*math.sin(a*(j+2)+p+ring*.04) for j,p in enumerate(phases))
+                points.append((cx+math.cos(a)*radius*wave,cy+math.sin(a)*radius*wave*1.25))
+            self.line(points)
+
+    def rule_drawing(self):
+        points=[(self.r.uniform(.15,.85)*self.w,self.r.uniform(.2,.8)*self.h) for _ in range(max(8,round(self.complexity*self.density*6)))]
+        # Join each point to its nearest unused neighbor: one continuous rule.
+        remaining=points[1:];path=points[:1]
+        while remaining:
+            x,y=path[-1];n=min(range(len(remaining)),key=lambda i:(remaining[i][0]-x)**2+(remaining[i][1]-y)**2)
+            path.append(remaining.pop(n))
+        self.line(path)
+        for x,y in points: self.d.ellipse((x-3*self.unit,y-3*self.unit,x+3*self.unit,y+3*self.unit),fill=0)
+
+    def render(self,mode):
+        getattr(self,mode)()
+        if self.symmetry>1:
+            left=self.image.crop((0,0,self.w//2,self.h))
+            self.image.paste(ImageOps.mirror(left),(self.w-self.w//2,0))
+        if self.invert: self.image=ImageOps.invert(self.image.convert('L')).convert('1',dither=Image.Dither.NONE)
+        return self.image
+
+
+def atomic_image(image,path):
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    fd,name=tempfile.mkstemp(prefix='.'+path.stem+'-',suffix='.png',dir=path.parent)
+    try:
+        with os.fdopen(fd,'wb') as f: image.save(f,format='PNG',optimize=False)
+        os.replace(name,path)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+
+def generate(args,daily=False):
+    mode=args.mode
+    date=dt.date.fromisoformat(args.date) if getattr(args,'date',None) else local_day()
+    seed=seed_number(f'cyberdeck-art-v1:{date.isoformat()}') if daily else seed_number(args.seed if args.seed is not None else int.from_bytes(os.urandom(8),'big'))
+    width,height=(args.width,args.height) if args.width and args.height else size_auto()
+    params={k:getattr(args,k) for k in ('density','stroke','complexity','spacing','symmetry','invert','text')}
+    path=ROOT/'daily'/f'{date}.png' if daily else Path(args.output) if args.output else ROOT/'variations'/f'{mode}-{seed}.png'
+    path.parent.mkdir(parents=True,exist_ok=True)
+    lockpath=path.with_suffix('.lock')
+    with lockpath.open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        if daily and path.exists() and not args.force: return path
+        image=Drawing(width,height,seed,**params).render(mode)
+        atomic_image(image,path)
+        metadata={'date':str(date),'seed':seed,'mode':mode,'width':width,'height':height,'parameters':params,'version':1}
+        meta=path.with_suffix('.json');temporary=meta.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(metadata,indent=2)+'\n');os.replace(temporary,meta)
+    return path
+
+
+def latest():
+    current=ROOT/'current.png'
+    if current.exists(): return current
+    pieces=sorted((ROOT/'daily').glob('????-??-??.png'))
+    if pieces: return pieces[-1]
+    return generate(parser().parse_args(['generate-daily']),True)
+
+
+def background(path):
+    with Image.open(path) as source: atomic_image(source.convert('1'),ROOT/'current.png')
+    meta=Path(path).with_suffix('.json')
+    if meta.exists() and meta!=ROOT/'current.json':
+        (ROOT/'current.json').write_text(meta.read_text())
+    pidfile=ROOT/'desktop.pid'
+    try:
+        pid=int(pidfile.read_text());cmd=Path(f'/proc/{pid}/cmdline').read_bytes()
+        if b'artgen' in cmd and b'--desktop' in cmd:
+            os.kill(pid,signal.SIGUSR1);return
+    except (OSError,ValueError): pass
+    with open(ROOT/'display.log','ab') as log:
+        subprocess.Popen([sys.executable,__file__,'view','--desktop','--path',str(ROOT/'current.png')],stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
+
+
+def view(path,desktop=False):
+    import cairo
+    import gi
+    gi.require_version('Gtk','3.0')
+    from gi.repository import Gtk,Gdk,GdkPixbuf,GLib
+    if not desktop:
+        try: subprocess.run(['/usr/local/bin/kindle-keyboard','hide'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=4)
+        except (OSError,subprocess.TimeoutExpired): pass
+    window=Gtk.Window(title='Cyberdeck Art')
+    window.set_wmclass('deck-art-desktop' if desktop else 'deck-art','CyberdeckArt')
+    window.set_decorated(False)
+    if desktop:
+        window.set_type_hint(Gdk.WindowTypeHint.DESKTOP);window.set_keep_below(True)
+        window.set_skip_taskbar_hint(True);window.set_skip_pager_hint(True);window.set_accept_focus(False)
+        window.move(0,0);window.set_default_size(*size_auto());(ROOT/'desktop.pid').write_text(str(os.getpid()))
+    else: window.fullscreen()
+    overlay=Gtk.Overlay();window.add(overlay)
+    canvas=Gtk.DrawingArea();overlay.add(canvas)
+    state={'pixbuf':None,'data':None,'path':Path(path)}
+    def load():
+        try:
+            with Image.open(state['path']) as source:
+                rgb=source.convert('RGB');data=GLib.Bytes.new(rgb.tobytes())
+                state['pixbuf']=GdkPixbuf.Pixbuf.new_from_bytes(data,GdkPixbuf.Colorspace.RGB,False,8,rgb.width,rgb.height,rgb.width*3)
+                state['data']=data
+            canvas.queue_draw()
+        except OSError as exc: print('Art display retained:',exc,file=sys.stderr)
+        return False
+    def draw(widget,cr):
+        w,h=widget.get_allocated_width(),widget.get_allocated_height()
+        cr.set_source_rgb(1,1,1);cr.paint();pix=state['pixbuf']
+        if pix:
+            scale=min(w/pix.get_width(),h/pix.get_height())
+            cr.translate((w-pix.get_width()*scale)/2,(h-pix.get_height()*scale)/2);cr.scale(scale,scale)
+            Gdk.cairo_set_source_pixbuf(cr,pix,0,0);cr.get_source().set_filter(cairo.FILTER_NEAREST);cr.paint()
+        return False
+    canvas.connect('draw',draw)
+    bar=Gtk.Box(spacing=8);bar.set_halign(Gtk.Align.CENTER);bar.set_valign(Gtk.Align.END)
+    bar.set_margin_bottom(136 if desktop else 24);overlay.add_overlay(bar)
+    css=Gtk.CssProvider();css.load_from_data(b'button {font: 30px Sans; min-height:72px; padding:12px 18px; border:3px solid black; border-radius:0; background:white; color:black;}')
+    Gtk.StyleContext.add_provider_for_screen(window.get_screen(),css,600)
+    def action(command):
+        if command=='back':
+            if desktop: subprocess.Popen(['/usr/local/bin/deck-home']) if Path('/usr/local/bin/deck-home').exists() else subprocess.Popen(['/usr/local/bin/kindle-terminal','-e','/usr/local/bin/cyberdeck'])
+            else:
+                if Path('/usr/local/bin/deck-home').exists(): subprocess.Popen(['/usr/local/bin/deck-home'])
+                window.destroy()
+        elif command=='daily':
+            state['path']=generate(parser().parse_args(['generate-daily']),True)
+            if desktop: background(state['path']);state['path']=ROOT/'current.png'
+            load()
+        else:
+            old=state['path'].with_suffix('.json')
+            try: mode=json.loads(old.read_text()).get('mode','lsystem_flower')
+            except (OSError,ValueError): mode='lsystem_flower'
+            if command=='style': mode=MODES[(MODES.index(mode)+1)%len(MODES)]
+            state['path']=generate(parser().parse_args(['generate','--mode',mode]))
+            if desktop: background(state['path']);state['path']=ROOT/'current.png'
+            load()
+    for label,command in [('New piece','new'),('Next style','style'),('Today','daily'),('Back','back')]:
+        button=Gtk.Button(label=label);button.connect('clicked',lambda _b,c=command:action(c));bar.pack_start(button,False,False,0)
+    if not desktop:
+        menu_button=Gtk.Button(label='Menu')
+        menu_button.set_halign(Gtk.Align.END);menu_button.set_valign(Gtk.Align.START)
+        menu_button.set_margin_top(16);menu_button.set_margin_end(16)
+        menu_button.connect('clicked',lambda *_:action('back'))
+        overlay.add_overlay(menu_button)
+    canvas.add_events(Gdk.EventMask.BUTTON_RELEASE_MASK)
+    canvas.connect('button-release-event',lambda *_:bar.set_visible(not bar.get_visible()))
+    window.connect('key-press-event',lambda _w,e:window.destroy() if e.keyval==Gdk.KEY_Escape and not desktop else False)
+    window.connect('destroy',lambda *_:Gtk.main_quit())
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT,signal.SIGTERM,lambda:window.destroy() or False)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT,signal.SIGUSR1,lambda:load() or True)
+    load();window.show_all();bar.hide()
+    # Exactly one redraw when the date changes; no animation or periodic painting.
+    day=[local_day()]
+    def midnight():
+        today=local_day()
+        if desktop and today!=day[0]:
+            day[0]=today
+            try: background(generate(parser().parse_args(['generate-daily']),True));load()
+            except Exception as exc: print('Daily art retained:',exc,file=sys.stderr)
+        return True
+    if desktop: GLib.timeout_add_seconds(3600,midnight)
+    if desktop: window.get_screen().connect('size-changed',lambda *_:window.resize(*size_auto()))
+    Gtk.main()
+
+
+def parser():
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--archive',type=Path)
+    sub=p.add_subparsers(dest='command',required=True)
+    for name in ('generate','generate-daily','cycle'):
+        q=sub.add_parser(name);q.add_argument('--mode',choices=MODES,default='lsystem_flower')
+        q.add_argument('--seed');q.add_argument('--width',type=int);q.add_argument('--height',type=int)
+        q.add_argument('--density',type=float,default=1);q.add_argument('--stroke',type=float,default=2)
+        q.add_argument('--complexity',type=int,default=5);q.add_argument('--spacing',type=float,default=1)
+        q.add_argument('--symmetry',type=int,choices=range(1,9),default=1);q.add_argument('--invert',action='store_true')
+        q.add_argument('--text',default='');q.add_argument('--output',type=Path);q.add_argument('--date');q.add_argument('--force',action='store_true')
+    sub.add_parser('list-modes');sub.add_parser('show-latest');sub.add_parser('disable')
+    q=sub.add_parser('set-background');q.add_argument('--latest',action='store_true');q.add_argument('--path',type=Path)
+    q=sub.add_parser('view');q.add_argument('--desktop',action='store_true');q.add_argument('--path',type=Path)
+    return p
+
+
+def main():
+    global ROOT
+    args=parser().parse_args()
+    if args.archive: ROOT=args.archive
+    ROOT.mkdir(parents=True,exist_ok=True)
+    if args.command=='list-modes': print('\n'.join(MODES));return
+    if args.command=='disable':
+        (ROOT/'disabled').touch()
+        try:
+            pid=int((ROOT/'desktop.pid').read_text())
+            if b'artgen' in Path(f'/proc/{pid}/cmdline').read_bytes(): os.kill(pid,signal.SIGTERM)
+        except (OSError,ValueError): pass
+        return
+    if args.command in {'generate','generate-daily','cycle'}:
+        if not .2<=args.density<=2 or not 1<=args.complexity<=8 or not .4<=args.spacing<=3 or not .5<=args.stroke<=12:
+            raise ValueError('Use density .2–2, complexity 1–8, spacing .4–3, stroke .5–12.')
+        if (args.width is None)!=(args.height is None): raise ValueError('Set both width and height.')
+        if args.width and (not 240<=args.width<=2400 or not 240<=args.height<=3200): raise ValueError('Canvas must be 240–2400 by 240–3200 pixels.')
+        if args.command=='cycle':
+            try: old=json.loads((ROOT/'cycle.json').read_text())['mode'];args.mode=MODES[(MODES.index(old)+1)%len(MODES)]
+            except (OSError,ValueError,KeyError): pass
+        path=generate(args,args.command=='generate-daily');print(path)
+        if args.command=='cycle': (ROOT/'cycle.json').write_text(json.dumps({'mode':args.mode}));background(path)
+    elif args.command=='set-background':
+        (ROOT/'disabled').unlink(missing_ok=True)
+        background(args.path or latest())
+    elif args.command=='show-latest': view(latest())
+    elif args.command=='view': view(args.path or latest(),args.desktop)
+
+
+if __name__=='__main__':
+    try: main()
+    except (OSError,ValueError) as exc: print('Artgen:',exc,file=sys.stderr);sys.exit(1)

@@ -1,0 +1,37 @@
+#!/bin/sh
+# Local backend for Tailscale's userspace networking. No Wi-Fi port is opened.
+set -eu
+PACKAGES=/mnt/kindle/linux/ssh-server
+if [ ! -x /usr/sbin/dropbear ]; then
+  # Verify signatures using Alpine's existing trust store before installing.
+  apk verify "$PACKAGES"/*.apk
+  if ! apk add --no-network "$PACKAGES"/*.apk; then
+    # The original image can retain an unrelated package-trigger error.
+    # Continue only if the installed server and its libraries actually load.
+    /usr/sbin/dropbear -V
+  fi
+fi
+root_home=$(awk -F: '$1 == "root" { print $6; exit }' /etc/passwd)
+[ -n "$root_home" ] && [ "$root_home" != / ] || exit 1
+mkdir -p "$root_home/.ssh" /etc/dropbear /run
+chown 0:0 "$root_home"
+chmod go-w "$root_home"
+chmod 700 "$root_home/.ssh"
+key=$(cat "$PACKAGES/omarchy.pub")
+touch "$root_home/.ssh/authorized_keys"
+if ! grep -qxF "$key" "$root_home/.ssh/authorized_keys"; then
+  printf '%s\n' "$key" >>"$root_home/.ssh/authorized_keys"
+fi
+chmod 600 "$root_home/.ssh/authorized_keys"
+chown -R 0:0 "$root_home/.ssh"
+if [ ! -f /etc/dropbear/dropbear_ed25519_host_key ]; then
+  dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
+fi
+if [ -f /run/cyberdeck-sshd.pid ] && kill -0 "$(cat /run/cyberdeck-sshd.pid)" 2>/dev/null; then
+  exit 0
+fi
+nohup /usr/sbin/dropbear -F -E -s -j -k \
+  -r /etc/dropbear/dropbear_ed25519_host_key \
+  -p 127.0.0.1:22 -P /run/cyberdeck-sshd.pid \
+  </dev/null >>/mnt/kindle/linux/sshd.log 2>&1 &
+echo $! >/run/cyberdeck-sshd.pid

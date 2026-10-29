@@ -1,0 +1,485 @@
+#!/usr/bin/python3
+"""Native monochrome machine console. Polls only while its window is active."""
+import importlib.machinery
+import importlib.util
+import datetime
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from zoneinfo import ZoneInfo,ZoneInfoNotFoundError
+from concurrent.futures import ThreadPoolExecutor
+
+HERE=Path(__file__).resolve().parent
+loader=importlib.machinery.SourceFileLoader('instrument_probe',str(HERE/'deck-instrument-probe'))
+spec=importlib.util.spec_from_loader(loader.name,loader)
+probe=importlib.util.module_from_spec(spec);loader.exec_module(probe)
+NODES=[('kindle','00','KINDLE','LOCAL CONSOLE'),('omarchy','01','OMARCHY','LINUX WORKSTATION'),('mac','02','MACBOOK','AI / MACOS')]
+NAMES={key:name for key,_num,name,_role in NODES}
+INTERVAL=60
+APPLICATION_ID='org.cyberdeck.Instruments'
+CACHE=Path.home()/'.cache/kindle-instruments/snapshot.json'
+CLOCK_TZ=os.environ.get('CYBERDECK_TZ','America/Los_Angeles')
+
+
+def clock_values(timestamp=None):
+    try:zone=ZoneInfo(CLOCK_TZ)
+    except ZoneInfoNotFoundError:zone=datetime.timezone.utc
+    stamp=datetime.datetime.fromtimestamp(time.time() if timestamp is None else timestamp,zone)
+    return stamp.strftime('%H:%M'),stamp.strftime('%Y.%m.%d'),stamp.tzname()
+
+
+def draw_clock(ctx,width,height,values):
+    current,date,zone=values
+    ctx.set_source_rgb(0,0,0);ctx.rectangle(0,0,width,height);ctx.fill()
+    ctx.set_source_rgb(1,1,1);ctx.select_font_face('DejaVu Sans Mono',0,1)
+    ctx.set_font_size(17);ctx.move_to(16,22);ctx.show_text('LOCAL // '+zone)
+    segments={'0':'abcedf','1':'bc','2':'abdeg','3':'abcdg','4':'bcfg',
+              '5':'acdfg','6':'acdefg','7':'abc','8':'abcdefg','9':'abcdfg'}
+    w=48;h=70;t=7;gap=16;start=16;top=34
+    for char in current:
+        if char==':':
+            ctx.rectangle(start+2,top+21,7,7);ctx.rectangle(start+2,top+46,7,7);ctx.fill();start+=24;continue
+        shapes={'a':(t,0,w-2*t,t),'b':(w-t,t,t,h/2-t),'c':(w-t,h/2,t,h/2-t),
+                'd':(t,h-t,w-2*t,t),'e':(0,h/2,t,h/2-t),'f':(0,t,t,h/2-t),'g':(t,h/2-t/2,w-2*t,t)}
+        for segment in segments.get(char,''):
+            x,y,sw,sh=shapes[segment];ctx.rectangle(start+x,top+y,sw,sh)
+        ctx.fill();start+=w+gap
+    ctx.set_font_size(18);ctx.move_to(16,height-12);ctx.show_text(date+' / DECK.06')
+
+
+def text(value,limit=160):
+    return ''.join(c for c in str(value) if c.isprintable())[:limit]
+
+
+def size(value):
+    if value is None:return '—'
+    for unit in ('B','K','M','G','T'):
+        if abs(value)<1024:return ('%.1f' % value if unit in ('G','T') else '%.0f' % value)+unit
+        value/=1024
+    return '—'
+
+
+def age(seconds):
+    if seconds<60:return '%ds' % max(0,int(seconds))
+    if seconds<3600:return '%dm' % int(seconds/60)
+    return '%dh' % int(seconds/3600)
+
+
+def uptime(value):
+    if value is None:return '—'
+    minutes=int(value)//60;hours,minutes=divmod(minutes,60);days,hours=divmod(hours,24)
+    return ('%dd ' % days if days else '')+'%02dh %02dm' % (hours,minutes)
+
+
+def ratio(value):
+    if not value or not value.get('total'):return None
+    return max(0,min(1,value.get('used',0)/value['total']))
+
+
+def error_state(message):
+    lowered=message.lower()
+    if any(term in lowered for term in ('tailscale ssh requires','authenticate, visit','permission denied','host key verification','remote host identification')):
+        return 'locked','SSH authorization required. Open Shell to complete the connection check.'
+    if any(term in lowered for term in ('python3: not found','python3: command not found')):
+        return 'unavailable','SSH answered, but Python 3 is unavailable.'
+    return 'offline','No SSH response. The machine may be asleep or unavailable.'
+
+
+class Collector:
+    def __init__(self):
+        self.children=set();self.lock=threading.Lock();self.closed=False
+
+    def stop(self):
+        self.closed=True
+        with self.lock:children=list(self.children)
+        for child in children:
+            try:os.killpg(child.pid,signal.SIGTERM)
+            except ProcessLookupError:pass
+
+    def remote(self,node):
+        if node not in ('omarchy','mac'):raise ValueError('Unknown machine alias')
+        started=time.monotonic()
+        command='export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; exec python3 -'
+        args=['ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=4','-o','ConnectionAttempts=1',
+              '-o','ServerAliveInterval=3','-o','ServerAliveCountMax=1',node,command]
+        child=None
+        try:
+            if self.closed:return {'state':'offline','error':'Console closed.'}
+            child=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                text=True,start_new_session=True)
+            with self.lock:self.children.add(child)
+            try:out,err=child.communicate((HERE/'deck-instrument-probe').read_text(),timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid,signal.SIGKILL);out,err=child.communicate()
+                state,message=error_state(out+'\n'+err)
+                return {'state':state,'error':message}
+            if child.returncode:
+                state,message=error_state(out+'\n'+err)
+                return {'state':state,'error':message}
+            data=json.loads(out)
+            if data.get('schema')!=1:raise ValueError('Unsupported telemetry response')
+            return {'state':'online','data':data,'received_at':time.time(),
+                    'probe_ms':int((time.monotonic()-started)*1000)}
+        except (OSError,ValueError):return {'state':'unavailable','error':'Could not read machine telemetry.'}
+        finally:
+            if child is not None:
+                with self.lock:self.children.discard(child)
+
+    def collect(self):
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            pending={node:workers.submit(self.remote,node) for node in ('omarchy','mac')}
+            local={'state':'online','data':probe.snapshot(),'received_at':time.time(),'probe_ms':0}
+            return dict(kindle=local,**{node:future.result() for node,future in pending.items()})
+
+
+def merge(previous,current):
+    merged={}
+    for node,entry in current.items():
+        entry=dict(entry)
+        if entry['state']!='online' and previous.get(node,{}).get('data'):
+            entry['data']=previous[node]['data'];entry['received_at']=previous[node].get('received_at',0)
+        merged[node]=entry
+    return merged
+
+
+def changes(previous,current):
+    events=[]
+    for node,entry in current.items():
+        old=previous.get(node,{})
+        if old.get('state')!=entry['state']:events.append(NAMES[node]+' / '+entry['state'].upper())
+        if old.get('state')=='online' and entry['state']=='online':
+            for field,label in [('sessions','SESSIONS'),('processes','PROCESS WATCH')]:
+                if old.get('data',{}).get(field)!=entry.get('data',{}).get(field):events.append(NAMES[node]+' / '+label+' CHANGED')
+            if old.get('data',{}).get('models')!=entry.get('data',{}).get('models'):events.append(NAMES[node]+' / MODEL STATE CHANGED')
+    return events
+
+
+def positions(width,height):
+    margin=12;gap=36
+    top_w=width/3-24;top_h=100
+    bottom_w=(width-2*margin-gap)/2;bottom_h=116
+    return {'kindle':((width-top_w)/2,8,top_w,top_h),
+            'omarchy':(margin,height-bottom_h-8,bottom_w,bottom_h),
+            'mac':(width-margin-bottom_w,height-bottom_h-8,bottom_w,bottom_h)}
+
+
+def draw_network(ctx,width,height,nodes,selected,paint_nodes=True):
+    ctx.set_source_rgb(1,1,1);ctx.paint()
+    boxes=positions(width,height)
+    center=width/2;bus=height*.49
+    ctx.set_source_rgb(0,0,0);ctx.set_line_width(3)
+    _x,y,_w,h=boxes['kindle']
+    ctx.move_to(center,y+h);ctx.line_to(center,bus);ctx.stroke()
+    for node in ('omarchy','mac'):
+        x,y,w,h=boxes[node]
+        ctx.set_dash([] if nodes.get(node,{}).get('state')=='online' else [9,9])
+        ctx.move_to(center,bus);ctx.line_to(x+w/2,bus);ctx.line_to(x+w/2,y);ctx.stroke()
+    ctx.set_dash([])
+    ctx.select_font_face('DejaVu Sans Mono',0,1)
+    def label(value,x,y,size):
+        ctx.set_font_size(size);ctx.move_to(x,y);ctx.show_text(value)
+    for node,num,name,role in NODES:
+        if not paint_nodes:continue
+        x,y,w,h=boxes[node];active=node==selected
+        ctx.set_source_rgb(0 if active else 1,0 if active else 1,0 if active else 1)
+        ctx.rectangle(x,y,w,h);ctx.fill_preserve()
+        ctx.set_source_rgb(0,0,0);ctx.set_line_width(5 if active else 3);ctx.stroke()
+        ctx.set_source_rgb(1 if active else 0,1 if active else 0,1 if active else 0)
+        label(num+' / '+name,x+16,y+35,28)
+        state=nodes.get(node,{}).get('state','unknown').upper()
+        if state=='ONLINE':state='LOCAL' if node=='kindle' else 'LINK UP'
+        label(state,x+16,y+65,23)
+        if h>105:label(role,x+16,y+94,18)
+    ctx.set_source_rgb(0,0,0)
+    # Registration marks and bus junction: all marks represent actual nodes.
+    ctx.rectangle(center-6,bus-6,12,12);ctx.fill()
+    label('PRIVATE SSH BUS',center+20,boxes['kindle'][1]+boxes['kindle'][3]+26,17)
+    for left in (0,width-22):
+        for offset in range(0,30,10):
+            ctx.move_to(left+offset/3,2);ctx.line_to(left+offset/3+8,10);ctx.stroke()
+
+
+def main():
+    if '--snapshot' in sys.argv:
+        collector=Collector()
+        try:print(json.dumps(collector.collect()))
+        finally:collector.stop()
+        return 0
+    import gi
+    gi.require_version('Gtk','3.0');gi.require_version('Gdk','3.0')
+    from gi.repository import Gtk,Gdk,Gio,GLib,Pango
+
+    CSS=b'''
+    window {background:white;color:black;font:28px "DejaVu Sans Mono";}
+    label {color:black;}
+    label.title {font: bold 42px "DejaVu Sans Mono";}
+    label.micro {font-size:23px;}
+    label.section {font-size:25px;font-weight:bold;}
+    label.number {font-size:42px;font-weight:bold;}
+    label.machine {font:bold 38px "DejaVu Sans Mono";background:black;color:white;padding:12px;}
+    label.brand {font:bold 49px "DejaVu Sans Mono";}
+    .instrument-meter {border:2px solid black;padding:12px;}
+    button {background:white;color:black;border:3px solid black;border-radius:0;min-height:64px;padding:12px;}
+    button:active {background:black;color:white;}
+    button.machine-node {padding:4px 12px;min-height:0;}
+    button.machine-node label {font:24px "DejaVu Sans Mono";color:black;}
+    button.node-selected {background:black;color:white;border:5px solid black;}
+    button.node-selected label {color:white;}
+    progressbar trough {background:white;border:2px solid black;min-height:22px;}
+    progressbar progress {background:black;min-height:22px;border-radius:0;}
+    scrollbar slider {min-width:40px;min-height:64px;background:black;}
+    '''
+
+    class Clock(Gtk.DrawingArea):
+        def __init__(self):
+            super().__init__();self.set_size_request(330,146);self.stamp=None
+            self.connect('draw',self.draw)
+
+        def draw(self,_widget,ctx):
+            self.stamp=clock_values();draw_clock(ctx,self.get_allocated_width(),self.get_allocated_height(),self.stamp)
+            return False
+
+        def update(self):
+            if clock_values()!=self.stamp:self.queue_draw()
+
+    class Network(Gtk.Overlay):
+        def __init__(self,app):
+            super().__init__();self.app=app;self.set_size_request(480,310)
+            self.canvas=Gtk.DrawingArea();self.canvas.set_size_request(480,310);self.add(self.canvas)
+            self.canvas.connect('draw',lambda _w,c:draw_network(c,self.get_allocated_width(),self.get_allocated_height(),app.nodes,app.selected,False))
+            self.layer=Gtk.Grid();self.layer.set_column_homogeneous(True)
+            self.layer.set_margin_top(8);self.layer.set_margin_bottom(8)
+            self.add_overlay(self.layer);self.set_overlay_pass_through(self.layer,False)
+            spacer=Gtk.Box();spacer.set_vexpand(True);self.layer.attach(spacer,0,1,6,1)
+            self.buttons={}
+            for node,num,name,role in NODES:
+                button=Gtk.Button();button.set_can_focus(False);button.get_style_context().add_class('machine-node')
+                label=Gtk.Label();label.set_xalign(0);button.add(label)
+                button.connect('clicked',lambda _b,key=node:app.select(key))
+                self.buttons[node]=button;button.set_hexpand(True)
+                if node=='kindle':
+                    button.set_size_request(-1,100);button.set_margin_start(12);button.set_margin_end(12)
+                    self.layer.attach(button,2,0,2,1)
+                elif node=='omarchy':
+                    button.set_size_request(-1,116);button.set_margin_start(12);button.set_margin_end(18)
+                    self.layer.attach(button,0,2,3,1)
+                else:
+                    button.set_size_request(-1,116);button.set_margin_start(18);button.set_margin_end(12)
+                    self.layer.attach(button,3,2,3,1)
+
+        def update(self):
+            for node,num,name,role in NODES:
+                context=self.buttons[node].get_style_context()
+                (context.add_class if node==self.app.selected else context.remove_class)('node-selected')
+                state=self.app.nodes.get(node,{}).get('state','unknown').upper()
+                if state=='ONLINE':state='LOCAL' if node=='kindle' else 'LINK UP'
+                self.buttons[node].get_child().set_markup('<span size="small">'+num+' // '+role+'</span>\n<b>'+name+'</b>  ['+state+']')
+            self.canvas.queue_draw()
+
+    class Instruments(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id=APPLICATION_ID)
+            self.window=None;self.selected='omarchy';self.nodes={};self.events=[]
+            self.collector=Collector();self.busy=False;self.paused=False;self.last_refresh=0
+            self.signature=None;self.closed=False
+
+        def do_activate(self):
+            if self.window:self.window.present();return
+            self.window=Gtk.ApplicationWindow(application=self,title='Cyberdeck Instruments')
+            self.window.set_wmclass('deck-instruments','CyberdeckInstruments');self.window.set_default_size(1100,1450)
+            self.window.connect('destroy',self.shutdown)
+            css=Gtk.CssProvider();css.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(self.window.get_screen(),css,600)
+            outer=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=14);outer.set_border_width(24);self.window.add(outer)
+            header=Gtk.Box(spacing=18);brand=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=10)
+            self.heading=self.label('CYBERDECK','brand');brand.pack_start(self.heading,False,False,0)
+            brand.pack_start(self.label('FIELD OPERATIONS // MK.06','micro'),False,False,0)
+            brand.pack_start(self.label('INSTRUMENTS / PRIVATE SSH','micro'),False,False,0)
+            header.pack_start(brand,True,True,0);self.clock=Clock();header.pack_end(self.clock,False,False,0)
+            outer.pack_start(header,False,False,0)
+            self.ribbon=self.label('LINK BUS [ — / 03 ]  //  ACQUIRING TELEMETRY','micro');outer.pack_start(self.ribbon,False,False,0)
+            scroll=Gtk.ScrolledWindow();scroll.set_policy(Gtk.PolicyType.NEVER,Gtk.PolicyType.AUTOMATIC)
+            outer.pack_start(scroll,True,True,0)
+            content=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=18);scroll.add(content)
+            self.install_swipe(scroll)
+            self.network=Network(self);content.pack_start(self.network,False,False,0)
+            self.machine=self.label('01 // OMARCHY','machine');content.pack_start(self.machine,False,False,0)
+            self.detail=self.label('Waiting for the first reading.','micro');content.pack_start(self.detail,False,False,0)
+            meters=Gtk.Box(spacing=22);meters.set_homogeneous(True)
+            self.load_label,self.load_bar=self.meter(meters,'LOAD / 1 MIN')
+            self.memory_label,self.memory_bar=self.meter(meters,'MEMORY / IN USE')
+            content.pack_start(meters,False,False,0)
+            self.vitals=self.label('UP —  /  STORAGE —','micro');content.pack_start(self.vitals,False,False,0)
+            self.actions=Gtk.Grid(column_spacing=14,row_spacing=12);self.actions.set_column_homogeneous(True)
+            content.pack_start(self.actions,False,False,0)
+            self.work=self.label('PROCESS WATCH\nNo reading yet.');content.pack_start(self.work,False,False,0)
+            self.models=self.label('MODEL BANK\nNo reading yet.');content.pack_start(self.models,False,False,0)
+            self.sessions_box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=10);content.pack_start(self.sessions_box,False,False,0)
+            content.pack_start(self.label('EVENT BUFFER // SESSION','section'),False,False,0)
+            self.activity=self.label('Waiting for telemetry.','micro');content.pack_start(self.activity,False,False,0)
+            self.note=self.label('Readings every 60s while this window is active.','micro');outer.pack_start(self.note,False,False,0)
+            footer=Gtk.Box(spacing=14);footer.set_homogeneous(True)
+            footer.pack_start(self.button('Home',lambda:self.launch(['deck-home'])),True,True,0)
+            self.pause_button=self.button('Pause',self.toggle_pause);footer.pack_start(self.pause_button,True,True,0)
+            self.refresh_button=self.button('Read now',self.refresh);footer.pack_start(self.refresh_button,True,True,0)
+            outer.pack_start(footer,False,False,0)
+            try:
+                cached=json.loads(CACHE.read_text())
+                for node,entry in cached.get('nodes',{}).items():
+                    if node in NAMES:entry['state']='cached';self.nodes[node]=entry
+            except (OSError,ValueError,TypeError):pass
+            self.render();self.window.show_all();self.window.maximize()
+            GLib.idle_add(self.refresh);GLib.timeout_add_seconds(5,self.tick)
+
+        def label(self,value,style=None):
+            widget=Gtk.Label(label=value);widget.set_xalign(0);widget.set_line_wrap(True)
+            widget.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR);widget.set_max_width_chars(60)
+            if style:widget.get_style_context().add_class(style)
+            return widget
+
+        def button(self,value,callback):
+            widget=Gtk.Button(label=value.upper());widget.set_can_focus(False)
+            child=widget.get_child();child.set_line_wrap(True);child.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            widget.connect('clicked',lambda _b:callback());return widget
+
+        def meter(self,parent,title):
+            box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=5)
+            box.get_style_context().add_class('instrument-meter')
+            box.pack_start(self.label(title,'section'),False,False,0)
+            value=self.label('—','number');box.pack_start(value,False,False,0)
+            bar=Gtk.ProgressBar();box.pack_start(bar,False,False,0);parent.pack_start(box,True,True,0)
+            return value,bar
+
+        def install_swipe(self,scroll):
+            gesture=Gtk.GestureDrag.new(scroll);gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            state={}
+            def begin(_g,_x,_y):state['y']=scroll.get_vadjustment().get_value()
+            def drag(g,_x,y):
+                if abs(y)>18:
+                    g.set_state(Gtk.EventSequenceState.CLAIMED)
+                    adjustment=scroll.get_vadjustment();adjustment.set_value(state.get('y',0)-y)
+            gesture.connect('drag-begin',begin);gesture.connect('drag-update',drag);scroll._swipe=gesture
+
+        def select(self,node):
+            self.selected=node;self.signature=None;self.render()
+
+        def tick(self):
+            if self.closed:return False
+            if self.window.get_property('is-active'):self.clock.update()
+            if not self.paused and self.window.get_property('is-active') and time.monotonic()-self.last_refresh>=INTERVAL:
+                self.refresh()
+            return True
+
+        def toggle_pause(self):
+            self.paused=not self.paused;self.pause_button.set_label('RESUME' if self.paused else 'PAUSE')
+            self.note.set_text('HOLD / automatic readings paused.' if self.paused else 'Readings every 60s while this window is active.')
+            if not self.paused:self.refresh()
+
+        def refresh(self):
+            if self.closed or self.busy:return False
+            self.busy=True;self.refresh_button.set_sensitive(False);self.note.set_text('READING / local + two private SSH probes…')
+            def worker():
+                try:current=self.collector.collect();error=None
+                except Exception as exc:current=None;error=text(exc)
+                GLib.idle_add(self.received,current,error)
+            threading.Thread(target=worker,daemon=True).start();return False
+
+        def received(self,current,error):
+            if self.closed:return False
+            self.busy=False;self.last_refresh=time.monotonic();self.refresh_button.set_sensitive(True)
+            if current is None:
+                self.note.set_text('READ FAILED / '+(error or 'Try Read now.'));return False
+            for event in changes(self.nodes,current):self.events.insert(0,time.strftime('%H:%M')+'  '+event)
+            self.events=self.events[:7];self.nodes=merge(self.nodes,current)
+            battery=self.nodes.get('kindle',{}).get('data',{}).get('battery')
+            power=' / BAT %d%%' % battery['percent'] if battery else ''
+            self.ribbon.set_text('LINK BUS [ %02d / 03 ]%s // TELEMETRY READY' % (sum(e['state']=='online' for e in self.nodes.values()),power))
+            self.note.set_text('HOLD / automatic readings paused.' if self.paused else 'READ %s / next in 60s while active.' % time.strftime('%H:%M'))
+            try:
+                CACHE.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+                temporary=CACHE.with_suffix('.tmp');temporary.write_text(json.dumps({'nodes':self.nodes}));temporary.chmod(0o600);temporary.replace(CACHE)
+            except OSError:pass
+            self.render();return False
+
+        def render(self):
+            node=self.selected;entry=self.nodes.get(node,{})
+            data=entry.get('data',{});state=entry.get('state','unknown')
+            self.machine.set_text('%s // %s' % (next(n for k,n,_name,_role in NODES if k==node),NAMES[node]))
+            detail=state.upper()
+            if entry.get('received_at'):
+                detail+=' / '+('READ ' if state=='online' else 'LAST GOOD ')+age(time.time()-entry['received_at'])+' AGO'
+            if entry.get('probe_ms') and state=='online':detail+=' / PROBE %.1fs' % (entry['probe_ms']/1000)
+            if entry.get('error'):detail+='\n'+entry['error']
+            self.detail.set_text(detail)
+            load=data.get('load');cores=data.get('cores',1)
+            self.load_label.set_text('%.2f / %dC' % (load[0],cores) if load else '—')
+            self.load_bar.set_fraction(min(1,max(0,load[0]/max(1,cores))) if load else 0)
+            memory=data.get('memory');used=ratio(memory)
+            self.memory_label.set_text('%d%% / %s' % (round(100*used),size(memory['total'])) if used is not None else '—')
+            self.memory_bar.set_fraction(used or 0)
+            storage=data.get('storage');battery=data.get('battery')
+            vital='UP '+uptime(data.get('uptime'))
+            if storage:vital+=' / FREE '+size(storage['total']-storage['used'])
+            if battery:vital+=' / BAT %d%% %s' % (battery['percent'],battery.get('status','').upper())
+            self.vitals.set_text(vital)
+            processes=data.get('processes')
+            listing=' / '.join('%s ×%d' % (p['name'],p['count']) for p in processes or []) or ('None of the watched programs running.' if data else 'No reading available.')
+            work=data.get('work')
+            if work:listing+='\nArchive jobs %d / AI replies %d' % (work['transfers'],work['replies'])
+            self.work.set_text('PROCESS WATCH\n'+listing)
+            models=data.get('models',{})
+            bank='\n'.join(text(v) for v in models.get('loaded',[])) or ('Ollama online / no models loaded.' if models.get('available') else 'Ollama not responding.')
+            if data.get('fm_installed'):bank+='\nApple FM command installed.'
+            if any(p['name']=='Cyberpunk' for p in processes or []):bank+='\nGAME ACTIVE / local AI loading is deferred.'
+            self.models.set_text('MODEL BANK\n'+(bank if data else 'No reading available.'))
+            self.activity.set_text('\n'.join(self.events) or 'No changes recorded yet.')
+            signature=json.dumps([node,data.get('sessions',[]),state],sort_keys=True)
+            if signature!=self.signature:
+                self.signature=signature
+                for child in self.actions.get_children():self.actions.remove(child)
+                for i,(label,command) in enumerate(self.commands(node)):
+                    button=self.button(label,lambda c=command:self.launch(c));button.set_hexpand(True)
+                    self.actions.attach(button,i%2,i//2,1,1)
+                for child in self.sessions_box.get_children():self.sessions_box.remove(child)
+                self.sessions_box.pack_start(self.label('TMUX / PERSISTENT SESSIONS','section'),False,False,0)
+                items=data.get('sessions',[])
+                if not items:self.sessions_box.pack_start(self.label('No sessions.' if data else 'No reading available.','micro'),False,False,0)
+                for session in items:
+                    label=text(session['name'])+' / %d window%s / %s' % (session['windows'],'s' if session['windows']!=1 else '', 'attached' if session['attached'] else 'detached')
+                    if node!='kindle' and re.fullmatch(r'[A-Za-z0-9_-]{1,60}',session['name']):
+                        widget=self.button('Resume '+label,lambda n=session['name']:self.launch(['kindle-terminal','-T',NAMES[node]+' / '+n,'-e','deck-connect',node,n]))
+                    else:widget=self.label(label,'micro')
+                    self.sessions_box.pack_start(widget,False,False,0)
+                self.actions.show_all();self.sessions_box.show_all()
+            self.network.update()
+
+        def commands(self,node):
+            if node=='kindle':return [('Terminal',['kindle-terminal']),('htop',['deck-htop']),('Home',['deck-home']),('Art mode',['artgen','show-latest'])]
+            terminal=lambda title,session,remote=None:['kindle-terminal','-T',title,'-e','deck-connect',node,session]+([remote] if remote else [])
+            actions=[('Shell',terminal(NAMES[node]+' shell','kindle')),('htop',['deck-htop',node])]
+            if node=='omarchy':actions += [('Codex',terminal('Codex','codex','exec codex')),('OpenCode',terminal('OpenCode','opencode','exec opencode')),('Screen',['deck-display'])]
+            else:actions += [('FM chat',['kindle-terminal','-T','Mac FM AI','-e','deck-mac-ai','fm']),('Local AI',['kindle-terminal','-T','Mac local AI','-e','deck-mac-ai','local'])]
+            return actions
+
+        def launch(self,command):
+            try:
+                env=os.environ.copy();env.pop('WINDOWID',None)
+                with open('/tmp/kindle-instruments-actions.log','ab') as log:
+                    subprocess.Popen(command,env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
+                self.note.set_text('OPENED / '+text(command[0])+' / return with APPS.')
+            except OSError as exc:self.note.set_text('Could not open tool: '+text(exc))
+
+        def shutdown(self,*_args):
+            self.closed=True;self.collector.stop()
+
+    application=Instruments();return application.run(sys.argv)
+
+
+if __name__=='__main__':raise SystemExit(main())

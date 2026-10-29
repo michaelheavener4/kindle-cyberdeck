@@ -1,0 +1,38 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+action=${1:-toggle}
+has_owner() {
+  dbus-send --session --type=method_call --print-reply --reply-timeout=1500 \
+    --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+    string:org.onboard.Onboard 2>/dev/null | grep -q 'boolean true'
+}
+if ! has_owner; then
+  # A Hide request must never auto-activate Onboard's unconfigured D-Bus service.
+  [ "$action" != hide ] || exit 0
+  nohup /usr/local/bin/kindle-onboard </dev/null >>/mnt/kindle/linux/keyboard.log 2>&1 &
+  count=0
+  until has_owner; do
+    count=$((count+1));[ "$count" -lt 50 ] || exit 1;sleep .1
+  done
+  action=show
+fi
+case "$action" in
+  show|hide) ;;
+  toggle)
+    if xdotool search --onlyvisible --class Onboard >/dev/null 2>&1; then
+      action=hide
+    else
+      action=show
+    fi
+    ;;
+  *) echo "usage: $0 [show|hide|toggle]" >&2; exit 2 ;;
+esac
+case "$action" in
+  show) method=Show ;;
+  hide) method=Hide ;;
+esac
+# Docking itself reserves and releases the work area. Do not force geometry
+# here: that would put the keyboard's actual position out of sync with JWM.
+exec dbus-send --session --type=method_call --print-reply --reply-timeout=3000 \
+  --dest=org.onboard.Onboard /org/onboard/Onboard/Keyboard \
+  "org.onboard.Onboard.Keyboard.$method"

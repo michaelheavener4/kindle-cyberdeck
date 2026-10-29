@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""Joy-Con on the Alpine desktop and in mGBA.
+
+The Bluetooth bridge is started separately and is not a boot service.
+This process reads the controller the kernel already exposes and sends
+keys to the window in front. Page turns while the Kindle reader is in
+front are done by joycon-pages.sh, which taps the page.
+"""
+
+import os
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+EV_KEY = 1
+EV_ABS = 3
+EVENT = struct.Struct("<iiHHi")
+
+# Fallback when no map file is on the userstore. Same codes as joycon.map.
+DEFAULT_MAP = {
+    304: "b",
+    305: "a",
+    307: "x",
+    308: "y",
+    310: "l",
+    311: "r",
+    312: "zl",
+    313: "zr",
+    314: "minus",
+    315: "plus",
+    544: "up",
+    545: "down",
+    546: "left",
+    547: "right",
+}
+
+GB_KEYS = {
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "a": "x",
+    "b": "z",
+    "x": "Return",
+    "y": "BackSpace",
+    "plus": "Return",
+    "minus": "BackSpace",
+    "zr": "Tab",
+}
+
+DESKTOP_KEYS = {
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "a": "Return",
+    "b": "Escape",
+    "plus": "Return",
+    "minus": "Escape",
+    "l": "Prior",
+    "zl": "Prior",
+    "r": "Next",
+    "zr": "Next",
+}
+
+# One press, not a hold. Holds would repeat through the menu.
+TAP_NAMES = {"a", "b", "plus", "minus", "l", "zl", "r", "zr", "x", "y"}
+
+LEARN_ORDER = (
+    ("a", "A"),
+    ("b", "B"),
+    ("x", "X"),
+    ("y", "Y"),
+    ("l", "L"),
+    ("r", "R"),
+    ("zl", "ZL"),
+    ("zr", "ZR"),
+    ("plus", "Plus"),
+    ("minus", "Minus"),
+    ("up", "Up"),
+    ("down", "Down"),
+    ("left", "Left"),
+    ("right", "Right"),
+)
+
+STORE = "/mnt/kindle"
+if not os.path.isdir(STORE):
+    STORE = "/mnt/us"
+
+
+def ensure_store_link():
+    """The bridge writes to /mnt/us. Alpine only bind-mounts that at /mnt/kindle."""
+    if os.path.isdir("/mnt/kindle") and not os.path.exists("/mnt/us"):
+        os.symlink("/mnt/kindle", "/mnt/us")
+
+
+def store_path(*parts):
+    return os.path.join(STORE, *parts)
+
+
+def load_map(path):
+    found = {}
+    if not path or not os.path.isfile(path):
+        return dict(DEFAULT_MAP)
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            bits = line.split()
+            if len(bits) < 2:
+                continue
+            try:
+                found[int(bits[0])] = bits[1]
+            except ValueError:
+                continue
+    return found or dict(DEFAULT_MAP)
+
+
+def active_map():
+    learned = store_path("joycon", "map")
+    default = store_path("linux", "joycon.map")
+    if os.path.isfile(learned):
+        return load_map(learned)
+    if os.path.isfile(default):
+        return load_map(default)
+    return dict(DEFAULT_MAP)
+
+
+def page_side(name):
+    if name in ("b", "l", "zl", "minus", "left", "up"):
+        return "prev"
+    if name in ("a", "r", "zr", "plus", "right", "down"):
+        return "next"
+    return None
+
+
+def lights_off(text):
+    out = []
+    for line in text.splitlines():
+        lower = line.lower()
+        if "joy-con" in lower and "lights=" not in lower:
+            line = line.rstrip() + " lights=off"
+        out.append(line)
+    body = "\n".join(out)
+    if text.endswith("\n") or not text:
+        body += "\n"
+    return body
+
+
+def unpack_event(raw):
+    if len(raw) < EVENT.size:
+        return None
+    _sec, _usec, kind, code, value = EVENT.unpack_from(raw)
+    return kind, code, value
+
+
+class Axis:
+    """Stick axis. The center depends on whether the report is 8, 12, or 16 bit."""
+
+    def __init__(self):
+        self.peak = 0
+        self.pos = 0
+
+    def edge(self, value):
+        self.peak = max(self.peak, abs(value))
+        if self.peak >= 10000:
+            center, dead = 32768, 12000
+        elif self.peak >= 1500:
+            center, dead = 2048, 600
+        elif self.peak >= 200:
+            center, dead = 128, 40
+        else:
+            return None
+        if value < center - dead:
+            pos = -1
+        elif value > center + dead:
+            pos = 1
+        else:
+            pos = 0
+        if pos == self.pos:
+            return None
+        self.pos = pos
+        return pos
+
+
+def gb_running():
+    path = "/tmp/kindle-gb.pid"
+    try:
+        with open(path, encoding="ascii") as handle:
+            pid = int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def window_for(pid):
+    try:
+        out = subprocess.check_output(
+            ["xdotool", "search", "--pid", str(pid)],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    for line in out.split():
+        if line.isdigit():
+            return line
+    return None
+
+
+def send_key(action, key, wid):
+    cmd = ["xdotool"]
+    if wid:
+        cmd.extend(["windowfocus", "--sync", wid])
+    cmd.extend([action, key])
+    subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def keys_for(name, gb):
+    table = GB_KEYS if gb else DESKTOP_KEYS
+    key = table.get(name)
+    if not key:
+        return None
+    if gb:
+        return "hold", key
+    if name in TAP_NAMES:
+        return "tap", key
+    return "hold", key
+
+
+def joycon_nodes():
+    path = "/proc/bus/input/devices"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return []
+    nodes = []
+    name = ""
+    for block in text.split("\n\n"):
+        name = ""
+        handler = ""
+        for line in block.splitlines():
+            if line.startswith("N: Name="):
+                name = line.lower()
+            elif line.startswith("H: Handlers="):
+                for bit in line.split():
+                    token = bit.replace("Handlers=", "")
+                    if token.startswith("event") and token[5:].isdigit():
+                        handler = token
+        if handler and ("joy-con" in name or "joycon" in name or "nintendo" in name):
+            nodes.append("/dev/input/" + handler)
+    return nodes
+
+
+def pair_flag_path():
+    return store_path("linux", "joycon.pair")
+
+
+class Watcher:
+    def __init__(self):
+        self.map = active_map()
+        self.map_mtime = None
+        self.axes = {}
+        self.down = {}
+        self.unknown = set()
+        self.gb_wid = None
+        self.gb_pid = None
+        self.stop = False
+
+    def refresh_map(self):
+        learned = store_path("joycon", "map")
+        default = store_path("linux", "joycon.map")
+        path = learned if os.path.isfile(learned) else default
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        if mtime == self.map_mtime and self.map:
+            return
+        self.map = active_map()
+        self.map_mtime = mtime
+
+    def release_all(self):
+        for key in list(self.down):
+            send_key("keyup", key, self.down[key])
+        self.down.clear()
+
+    def target(self):
+        pid = gb_running()
+        if pid is None:
+            self.gb_pid = None
+            self.gb_wid = None
+            return False, None
+        if pid != self.gb_pid:
+            self.gb_pid = pid
+            self.gb_wid = window_for(pid)
+        elif self.gb_wid is None:
+            self.gb_wid = window_for(pid)
+        return True, self.gb_wid
+
+    def apply_hold(self, key, wid, down):
+        if down:
+            if key not in self.down:
+                self.down[key] = wid
+                send_key("keydown", key, wid)
+        elif key in self.down:
+            send_key("keyup", key, self.down.pop(key))
+
+    def on_name(self, name, value):
+        if os.path.exists(pair_flag_path()):
+            return
+        gb, wid = self.target()
+        spec = keys_for(name, gb)
+        if spec is None:
+            return
+        mode, key = spec
+        if mode == "tap":
+            if value == 1:
+                send_key("key", key, wid)
+            return
+        if value == 1:
+            self.apply_hold(key, wid, True)
+        elif value == 0:
+            self.apply_hold(key, wid, False)
+
+    def on_axis(self, node, code, value, horizontal):
+        axis = self.axes.setdefault((node, code), Axis())
+        pos = axis.edge(value)
+        if pos is None:
+            return
+        neg, pos_name = ("left", "right") if horizontal else ("up", "down")
+        if pos < 0:
+            self.on_name(neg, 1)
+            self.on_name(pos_name, 0)
+        elif pos > 0:
+            self.on_name(pos_name, 1)
+            self.on_name(neg, 0)
+        else:
+            self.on_name(neg, 0)
+            self.on_name(pos_name, 0)
+
+    def on_event(self, node, kind, code, value):
+        if kind == EV_KEY:
+            name = self.map.get(code)
+            if name is None:
+                if value == 1 and code not in self.unknown:
+                    self.unknown.add(code)
+                    log("Unmapped key %s. Menu y, then learn, if this button should do something." % code)
+                return
+            if value == 2:
+                return
+            self.on_name(name, value)
+        elif kind == EV_ABS and code in (0, 3):
+            self.on_axis(node, code, value, True)
+        elif kind == EV_ABS and code in (1, 4):
+            self.on_axis(node, code, value, False)
+        elif kind == EV_ABS and code == 16:
+            if value < 0:
+                self.on_name("left", 1)
+                self.on_name("right", 0)
+            elif value > 0:
+                self.on_name("right", 1)
+                self.on_name("left", 0)
+            else:
+                self.on_name("left", 0)
+                self.on_name("right", 0)
+        elif kind == EV_ABS and code == 17:
+            if value < 0:
+                self.on_name("up", 1)
+                self.on_name("down", 0)
+            elif value > 0:
+                self.on_name("down", 1)
+                self.on_name("up", 0)
+            else:
+                self.on_name("up", 0)
+                self.on_name("down", 0)
+
+
+def log(text):
+    path = store_path("linux", "joycon.log")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+    except OSError:
+        pass
+    print(text)
+
+
+def bridge_bin():
+    return store_path("kindle_hid_passthrough", "kindle-hid-passthrough")
+
+
+def chmod_bridge(binary):
+    folder = os.path.dirname(binary)
+    for path in (
+        binary,
+        os.path.join(folder, "dist", "ld-linux-armhf.so.3"),
+        os.path.join(folder, "dist", "main.bin"),
+    ):
+        try:
+            os.chmod(path, 0o755)
+        except OSError:
+            pass
+
+
+def pages_script():
+    here = store_path("linux", "joycon-pages.sh")
+    if os.path.isfile(here):
+        return here
+    return None
+
+
+def run_pages(*args, quiet=False):
+    script = pages_script()
+    if script is None:
+        if not quiet:
+            log("joycon-pages.sh is not on the Kindle.")
+        return 1
+    env = os.environ.copy()
+    if quiet:
+        env["JOYCON_QUIET"] = "1"
+    return subprocess.call(["sh", script, *args], env=env)
+
+
+def pair():
+    ensure_store_link()
+    binary = bridge_bin()
+    if not os.path.isfile(binary):
+        print("The Joy-Con bridge is not on this Kindle yet.")
+        return 1
+    flag = pair_flag_path()
+    os.makedirs(os.path.dirname(flag), exist_ok=True)
+    open(flag, "a").close()
+    status = 1
+    chmod_bridge(binary)
+    try:
+        run_pages("stop-daemon")
+        print("Hold the small sync button on the Joy-Con rail until the lights slide.")
+        print("When a list appears, type the number of that Joy-Con.")
+        print("Pair the left and the right. Each one is its own controller.")
+        status = subprocess.call(
+            [binary, "--pair"],
+            cwd=os.path.dirname(binary),
+        )
+    finally:
+        try:
+            os.remove(flag)
+        except OSError:
+            pass
+    conf = store_path("kindle_hid_passthrough", "devices.conf")
+    if os.path.isfile(conf):
+        with open(conf, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+        rewritten = lights_off(text)
+        if rewritten != text:
+            with open(conf, "w", encoding="utf-8") as handle:
+                handle.write(rewritten)
+    if status == 0:
+        run_pages("start-daemon")
+    return status
+
+
+def learn():
+    print("Press each button when asked. Wait to skip one.")
+    print("The touch pad still works if a button has no code.")
+    flag = pair_flag_path()
+    os.makedirs(os.path.dirname(flag), exist_ok=True)
+    open(flag, "a").close()
+    try:
+        nodes = []
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not nodes:
+            nodes = joycon_nodes()
+            if not nodes:
+                time.sleep(0.5)
+        if not nodes:
+            print("No Joy-Con is connected. Pair it first, and leave the bridge running.")
+            return 1
+        fds = []
+        for node in nodes:
+            try:
+                fds.append(os.open(node, os.O_RDONLY | os.O_NONBLOCK))
+            except OSError as exc:
+                print("Could not read %s (%s)." % (node, exc))
+        if not fds:
+            return 1
+        learned = dict(active_map())
+        import select
+
+        for name, label in LEARN_ORDER:
+            print("Press %s." % label)
+            found = None
+            end = time.monotonic() + 8
+            while time.monotonic() < end and found is None:
+                ready, _, _ = select.select(fds, [], [], 0.4)
+                for fd in ready:
+                    try:
+                        raw = os.read(fd, EVENT.size)
+                    except OSError:
+                        continue
+                    parsed = unpack_event(raw)
+                    if parsed and parsed[0] == EV_KEY and parsed[2] == 1:
+                        found = parsed[1]
+            if found is None:
+                print("  skipped.")
+            else:
+                for old, mapped in list(learned.items()):
+                    if mapped == name and old != found:
+                        del learned[old]
+                learned[found] = name
+                print("  code %s." % found)
+        for fd in fds:
+            os.close(fd)
+    finally:
+        try:
+            os.remove(flag)
+        except OSError:
+            pass
+    path = store_path("joycon", "map")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("# Learned on this Kindle.\n")
+        for code, name in sorted(learned.items(), key=lambda item: item[1]):
+            handle.write("%s %s\n" % (code, name))
+    print("Saved %s." % path)
+    return 0
+
+
+def watch():
+    ensure_store_link()
+    watcher = Watcher()
+
+    def finish(_signum, _frame):
+        watcher.stop = True
+
+    signal.signal(signal.SIGTERM, finish)
+    signal.signal(signal.SIGINT, finish)
+    import select
+
+    fds = {}
+    daemon_try = 0
+    try:
+        while not watcher.stop:
+            watcher.refresh_map()
+            if time.monotonic() >= daemon_try:
+                daemon_try = time.monotonic() + 30
+                run_pages("start-daemon", quiet=True)
+            current = set(joycon_nodes())
+            for node, fd in list(fds.items()):
+                if node not in current:
+                    os.close(fd)
+                    del fds[node]
+                    watcher.release_all()
+            for node in current:
+                if node in fds:
+                    continue
+                try:
+                    fds[node] = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+                except OSError:
+                    continue
+            if not fds:
+                time.sleep(2)
+                continue
+            try:
+                ready, _, _ = select.select(list(fds.values()), [], [], 2)
+            except InterruptedError:
+                continue
+            for fd in ready:
+                node = next(
+                    (path for path, open_fd in fds.items() if open_fd == fd),
+                    None,
+                )
+                if node is None:
+                    continue
+                try:
+                    raw = os.read(fd, EVENT.size)
+                except OSError:
+                    continue
+                if not raw:
+                    os.close(fd)
+                    del fds[node]
+                    watcher.release_all()
+                    continue
+                parsed = unpack_event(raw)
+                if parsed:
+                    watcher.on_event(node, *parsed)
+    finally:
+        watcher.release_all()
+    return 0
+
+
+def self_test():
+    mapping = load_map(None)
+    assert mapping[305] == "a"
+    assert page_side("a") == "next"
+    assert page_side("b") == "prev"
+    assert page_side("zr") == "next"
+    assert page_side("x") is None
+    assert keys_for("a", True) == ("hold", "x")
+    assert keys_for("b", True) == ("hold", "z")
+    assert keys_for("zr", True) == ("hold", "Tab")
+    assert keys_for("a", False) == ("tap", "Return")
+    assert keys_for("up", False) == ("hold", "Up")
+    assert keys_for("l", False) == ("tap", "Prior")
+    text = "AA:BB:CC:DD:EE:FF/P classic Joy-Con (R)\n"
+    assert lights_off(text) == "AA:BB:CC:DD:EE:FF/P classic Joy-Con (R) lights=off\n"
+    again = lights_off(lights_off(text))
+    assert again.count("lights=") == 1
+    raw = struct.pack("<iiHHi", 0, 0, 1, 305, 1)
+    assert len(raw) == 16
+    assert unpack_event(raw) == (1, 305, 1)
+    axis = Axis()
+    assert axis.edge(32768) is None
+    assert axis.pos == 0
+    assert axis.edge(60000) == 1
+    assert axis.edge(60000) is None
+    assert axis.edge(32768) == 0
+    small = Axis()
+    assert small.edge(128) is None
+    assert small.edge(250) == 1
+    assert small.pos == 1
+    sample = "304 b\n305 a\n# note\n\n"
+    path = "/tmp/kindle-joycon-map-test"
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(sample)
+    try:
+        assert load_map(path)[304] == "b"
+    finally:
+        os.remove(path)
+    print("joycon self-test ok")
+    return 0
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "watch"
+    if cmd == "--self-test":
+        return self_test()
+    if cmd == "pair":
+        return pair()
+    if cmd == "learn":
+        return learn()
+    if cmd == "start-daemon":
+        ensure_store_link()
+        return run_pages("start-daemon")
+    if cmd == "stop-daemon":
+        return run_pages("stop-daemon")
+    if cmd == "watch":
+        return watch()
+    print("usage: deck-joycon watch|pair|learn|start-daemon|stop-daemon|--self-test")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

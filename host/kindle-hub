@@ -1,0 +1,680 @@
+#!/usr/bin/python3
+"""Private, JavaScript-free chat and Archive.org UI for the Kindle browser."""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import hashlib
+import html
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import secrets
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse as U
+import urllib.request as R
+from html.parser import HTMLParser
+
+class PlainText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {'script', 'style'}:
+            self.hidden += 1
+        elif tag in {'br', 'p', 'div'} and not self.hidden:
+            self.parts.append('\n')
+
+    def handle_endtag(self, tag):
+        if tag in {'script', 'style'} and self.hidden:
+            self.hidden -= 1
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+
+
+def plain(value):
+    parser = PlainText()
+    parser.feed(str(value))
+    return ''.join(parser.parts).strip()
+
+
+import kindle_eink as eink
+import kindle_archive_delivery as delivery
+import kindle_lichess
+
+STATE=Path.home()/'.local/share/kindle-hub'
+PORT=8765
+BASE=f'http://127.0.0.1:{PORT}'
+POOL=ThreadPoolExecutor(max_workers=2)
+LOCK=threading.RLock()
+TOKEN=''
+PDF_LOCK=threading.Lock()
+LICHESS_LOGIN=None
+
+
+def esc(value): return html.escape(str(value),quote=True)
+
+
+def fetch(url,limit=4_000_000):
+    req=R.Request(url,headers={'User-Agent':'Cyberdeck/1.0 (personal Archive reader)'})
+    with R.urlopen(req,timeout=25) as response: data=response.read(limit+1)
+    if len(data)>limit: raise ValueError('This file is too large for the lightweight reader. Use its original Archive.org page.')
+    return data
+
+
+@contextmanager
+def db():
+    con=sqlite3.connect(STATE/'chats.sqlite3',timeout=15)
+    con.row_factory=sqlite3.Row
+    try:
+        with con: yield con
+    finally: con.close()
+
+
+def init():
+    global TOKEN,LICHESS_LOGIN
+    os.umask(0o077);STATE.mkdir(parents=True,exist_ok=True)
+    (STATE/'cache').mkdir(exist_ok=True)
+    TOKEN=secrets.token_urlsafe(32)
+    LICHESS_LOGIN=kindle_lichess.Login(STATE)
+    with db() as con:
+        con.execute('PRAGMA journal_mode=WAL')
+        con.executescript('''CREATE TABLE IF NOT EXISTS chats(id TEXT PRIMARY KEY,title TEXT,provider TEXT,created REAL);
+        CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,chat_id TEXT,role TEXT,content TEXT,status TEXT);
+        CREATE TABLE IF NOT EXISTS archive_jobs(id TEXT PRIMARY KEY,item TEXT,file TEXT,title TEXT,state TEXT,message TEXT,destination TEXT);''')
+        con.execute("UPDATE messages SET status='done',content='This reply was interrupted. Please ask again.' WHERE status='pending'")
+        con.execute("UPDATE archive_jobs SET state='error',message='Transfer interrupted. Your downloaded copy is retained; please send again.' WHERE state IN ('queued','working')")
+
+
+def layout(title,body,pending=False):
+    refresh='<meta http-equiv="refresh" content="3">' if pending else ''
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{refresh}
+    <title>{esc(title)} · Cyberdeck</title><style>
+    html{{overflow-wrap:break-word}}body{{background:#fff;color:#111;font:32px sans-serif;margin:24px auto;padding:0 24px;max-width:1200px;line-height:1.45}}
+    h1{{font-size:44px;margin:12px 0}}h2{{font-size:36px}}a{{color:#111}}nav{{border-bottom:3px solid #111;padding-bottom:14px}}
+    nav a{{display:inline-block;margin:6px 16px 6px 0;padding:20px 12px;font-weight:bold;border:2px solid #111;min-height:72px;box-sizing:border-box}}input,textarea,select,button{{font:inherit;padding:20px;border:3px solid #111;background:white;color:#111;box-sizing:border-box;min-height:88px}}
+    textarea{{width:100%;min-height:120px}}input[type=search]{{width:100%}}button,.button{{display:inline-block;background:#111;color:white;padding:12px 20px;text-decoration:none;min-height:48px;box-sizing:border-box}}
+    .card,.message{{border:2px solid #aaa;padding:16px;margin:18px 0;background:white}}.user{{border-left:9px solid #111;background:#e9e6de}}
+    .content{{white-space:pre-wrap;overflow-wrap:break-word}}.muted{{font-size:18px;color:#444}}.thumb{{float:left;width:80px;max-height:110px;margin:0 18px 12px 0}}
+    .clear{{clear:both}}.scan{{display:block;max-width:100%;height:auto;margin:18px auto}}form{{margin:16px 0}}.history a{{display:block;margin:12px 0}}
+    label{{display:block;margin:14px 0;font-weight:bold}}label input,label select{{display:block;width:100%;margin-top:6px;min-width:0;max-width:100%;font-weight:normal}}
+    .search-form{{padding:18px;border:2px solid #111;background:#fff}}.search-form button{{width:100%;margin-top:10px}}.secondary{{background:white;color:#111;border:2px solid #111}}
+    .quick-links a,.pager a,.toolbar a{{display:inline-block;padding:12px 16px;margin:5px 6px 5px 0;border:2px solid #111;text-decoration:none;min-height:44px;box-sizing:border-box}}
+    .eyebrow{{font-size:24px;letter-spacing:2px;font-weight:bold}}fieldset{{border:2px solid #aaa;padding:12px;min-width:0}}legend{{font-weight:bold}}
+    .board-thumb{{float:left;max-width:240px;max-height:260px;margin:0 20px 18px 0;border:2px solid #111}}.post:target{{border:4px solid #111}}.post .content{{font-size:32px}}
+    .button,.quick-links a,.pager a,.toolbar a{{min-height:88px;padding:20px 22px}}.muted{{font-size:26px}}.content{{word-wrap:break-word}}.tile{{display:block;padding:28px;margin:20px 0;border:3px solid #111;text-decoration:none;font-weight:bold}}
+    .jump input{{max-width:160px}}.jump label{{display:inline-block;margin-right:8px}}.jump button{{vertical-align:bottom;margin-bottom:14px}}.facts{{border-bottom:1px solid #aaa;padding:10px 0}}
+    @media(max-width:480px){{body{{margin:12px auto;padding:0 12px;font-size:20px}}h1{{font-size:30px}}h2{{font-size:24px}}.search-form,.card{{padding:12px}}nav a{{margin-right:6px;padding:12px 6px;min-height:48px}}.thumb{{width:64px}}.button,.quick-links a,.pager a,.toolbar a{{min-height:56px;padding:12px}}.muted{{font-size:18px}}input,select,button{{min-height:56px;padding:12px}}.post .content{{font-size:22px}}}}
+    </style></head><body><nav><a href="/chat">Chat</a><a href="/archive">Archive</a><a href="/chats">History</a></nav>
+    <h1>{esc(title)}</h1>{body}<p class="muted">Cyberdeck · Private connection through SSH</p></body></html>'''
+
+
+def csrf(): return f'<input type="hidden" name="csrf" value="{TOKEN}">'
+
+
+def chat_home():
+    return layout('Chat',f'''<p>Ask a question, keep a conversation, or return to an earlier chat.</p>
+    <form method="post" action="/new">{csrf()}<label>Model <select name="provider"><option value="fm">Apple FM · on your Mac</option><option value="ollama">Local abliterated model · when the game is closed</option></select></label><p><button>New chat</button></p></form>
+    <div class="history">{chat_links()}</div>''')
+
+
+def chat_links():
+    with db() as con: rows=con.execute('SELECT * FROM chats ORDER BY created DESC LIMIT 30').fetchall()
+    return ''.join(f'<a href="/chat/{esc(r["id"])}">{esc(r["title"])} <span class="muted">· {esc(r["provider"])}</span></a>' for r in rows) or '<p>No conversations yet.</p>'
+
+
+def chat_page(chat_id):
+    with db() as con:
+        chat=con.execute('SELECT * FROM chats WHERE id=?',(chat_id,)).fetchone()
+        messages=con.execute('SELECT * FROM messages WHERE chat_id=? ORDER BY id',(chat_id,)).fetchall()
+    if not chat: raise ValueError('Conversation not found.')
+    pending=any(m['status']=='pending' for m in messages)
+    body=''
+    for message in messages:
+        role='You' if message['role']=='user' else 'Assistant'
+        text='Thinking…' if message['status']=='pending' else message['content']
+        body+=f'<div class="message {esc(message["role"])}"><strong>{role}</strong><div class="content">{esc(text)}</div></div>'
+    if not pending:
+        body+=f'''<form id="compose" action="/send" method="post">{csrf()}<input type="hidden" name="chat_id" value="{esc(chat_id)}"><label>Your message<textarea name="message" rows="4" maxlength="4000" required></textarea></label><p><button>Send</button> <a href="/chat">New conversation</a></p></form>'''
+    else: body+='<p>Waiting for the model. This page updates automatically.</p>'
+    return layout(chat['title'],body,pending)
+
+
+def answer(chat_id,message_id):
+    try:
+        with db() as con:
+            chat=con.execute('SELECT * FROM chats WHERE id=?',(chat_id,)).fetchone()
+            rows=con.execute("SELECT role,content FROM messages WHERE chat_id=? AND status='done' ORDER BY id DESC LIMIT 6",(chat_id,)).fetchall()
+        data={'provider':chat['provider'],'messages':[dict(r) for r in reversed(rows)]}
+        command='export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; exec kindle-local-ai --respond'
+        result=subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','mac',command],
+            input=json.dumps(data),text=True,capture_output=True,timeout=260)
+        response=json.loads(result.stdout)
+        if response.get('error'): raise RuntimeError(response['error'])
+        text=response.get('reply','').strip()
+        if not text: raise RuntimeError('The model returned an empty reply.')
+    except Exception as exc: text='Could not answer: '+str(exc)
+    with db() as con: con.execute("UPDATE messages SET content=?,status='done' WHERE id=?",(text,message_id))
+
+
+def item_id(value):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,200}',value): raise ValueError('Invalid Archive identifier.')
+    return value
+
+
+def metadata(identifier):
+    identifier=item_id(identifier)
+    path=STATE/'cache'/('meta-'+identifier+'.json')
+    if not path.exists() or time.time()-path.stat().st_mtime>3600:
+        data=fetch('https://archive.org/metadata/'+U.quote(identifier),8_000_000)
+        json.loads(data);path.write_bytes(data)
+    return json.loads(path.read_bytes())
+
+
+ARCHIVE_TYPES=[('all','Everything'),('texts','Books & texts'),('audio','Audio'),('etree','Live music'),('movies','Video'),('image','Images'),('software','Software'),('data','Data & datasets'),('collection','Collections'),('web','Web archives')]
+ARCHIVE_SORTS={'relevance':('Relevance',''), 'downloads':('Most viewed','downloads desc'), 'week':('Popular this week','week desc'),
+               'newest':('Recently added','publicdate desc'), 'date_desc':('Newest publication','date desc'),
+               'date_asc':('Oldest publication','date asc'), 'title':('Title A–Z','titleSorter asc')}
+ARCHIVE_FIELDS=('title','creator','subject','description','collection','language','year_from','year_to','format','scope','sort','access','adv','browse')
+
+
+def select(name, label, choices, selected):
+    options=''.join(f'<option value="{esc(value)}"'+(' selected' if value==selected else '')+f'>{esc(text)}</option>' for value,text in choices)
+    return f'<label>{esc(label)}<select name="{esc(name)}">{options}</select></label>'
+
+
+def archive_url(**params):
+    return '/archive?'+U.urlencode({k:v for k,v in params.items() if v not in ('',None)})
+
+
+def literal(value):
+    return '"'+value.replace('\\','\\\\').replace('"','\\"')+'"'
+
+
+def archive_query(query,kind,options):
+    clauses=[]
+    scope=options.get('scope','all')
+    if query:
+        clauses.append(f'{scope}:{literal(query)}' if scope in {'title','creator','subject','description'} else '('+query+')')
+    if kind in dict(ARCHIVE_TYPES) and kind!='all': clauses.append('mediatype:'+kind)
+    for key in ('title','creator','subject','description','collection','language','format'):
+        value=options.get(key,'')
+        if value: clauses.append(key+':'+literal(value))
+    start,end=options.get('year_from',''),options.get('year_to','')
+    if start or end:
+        if any(v and (not re.fullmatch(r'[0-9]{4}',v) or not 1<=int(v)<=9999) for v in (start,end)):
+            raise ValueError('Use four-digit years, such as 1900 or 2020.')
+        if start and end and start>end: raise ValueError('The first year must be before the last year.')
+        clauses.append(f'date:[{start+"-01-01" if start else "*"} TO {end+"-12-31" if end else "*"}]')
+    if options.get('access')=='public': clauses.append('NOT access-restricted-item:true')
+    return ' AND '.join(clauses) or '*:*'
+
+
+def archive_search(query='',kind='all',page=1,**filters):
+    query=query[:500].strip()
+    kind=kind if kind in dict(ARCHIVE_TYPES) else 'all'
+    options={key:str(filters.get(key,''))[:200].strip() for key in ARCHIVE_FIELDS}
+    order=options['sort'] if options['sort'] in ARCHIVE_SORTS else 'relevance'
+    options['sort']=order
+    advanced=options['adv']=='1'
+    state=dict(q=query,kind=kind,**options)
+    form='<p class="eyebrow">THE INTERNET ARCHIVE</p><form class="search-form" action="/archive">'
+    form+=f'<label>Search<input type="search" name="q" value="{esc(query)}" placeholder="Title, author, subject, or keywords"></label>'
+    form+=select('kind','Media type',ARCHIVE_TYPES,kind)
+    form+=select('sort','Sort results',[(k,v[0]) for k,v in ARCHIVE_SORTS.items()],order)
+    form+='<input type="hidden" name="browse" value="1">'
+    if advanced:
+        form+='<input type="hidden" name="adv" value="1"><fieldset><legend>Advanced search</legend>'
+        form+=select('scope','Search keywords in',[('all','All metadata / advanced query'),('title','Title'),('creator','Creator'),('subject','Subject'),('description','Description')],options['scope'])
+        for key,label,placeholder in [('title','Title contains','Exact words or phrase'),('creator','Creator / author','Name'),('subject','Subject','Topic'),('collection','Collection identifier','gutenberg'),('year_from','Published from year','1800'),('year_to','Published through year','2026')]:
+            form+=f'<label>{label}<input name="{key}" value="{esc(options[key])}" placeholder="{placeholder}"'+(' type="number" min="1" max="9999"' if key.startswith('year_') else '')+'></label>'
+        languages=[('','Any language'),('eng','English'),('fre','French'),('spa','Spanish'),('ger','German'),('ita','Italian'),('por','Portuguese'),('rus','Russian'),('jpn','Japanese'),('chi','Chinese'),('ara','Arabic'),('lat','Latin')]
+        if options['language'] and options['language'] not in dict(languages): languages.append((options['language'],options['language']))
+        form+=select('language','Language',languages,options['language'])
+        form+=select('format','File format',[('','Any format'),('EPUB','EPUB'),('Text PDF','Searchable PDF'),('PDF','PDF'),('DjVuTXT','Plain text'),('JPEG','JPEG images'),('MP3','MP3 audio'),('MPEG4','MP4 video')],options['format'])
+        form+=select('access','Availability',[('','All items'),('public','Hide restricted items')],options['access'])+'</fieldset>'
+    else:
+        for key in ARCHIVE_FIELDS:
+            if key not in {'sort','adv','browse'} and options[key]: form+=f'<input type="hidden" name="{key}" value="{esc(options[key])}">'
+    form+='<button>Search Archive</button></form>'
+    form+=f'<div class="toolbar"><a href="{esc(archive_url(**dict(state,adv="0" if advanced else "1")))}">{"Simple" if advanced else "Advanced"} search</a><a href="/archive">Clear filters</a></div>'
+    active=[f'{k.replace("_"," ")}: {v}' for k,v in options.items() if v and k not in {'sort','adv','browse','scope'}]
+    if active: form+='<p class="muted">'+esc(' · '.join(active))+'</p>'
+    if not query and kind=='all' and not active and options['browse']!='1':
+        body=form+'<h2>Browse the collections</h2><div class="quick-links">'
+        for ident,label in [('gutenberg','Project Gutenberg'),('americana','American Libraries'),('librivoxaudio','LibriVox audiobooks'),('prelinger','Prelinger films'),('softwarelibrary','Software Library')]:
+            body+=f'<a href="{esc(archive_url(collection=ident,sort="downloads",browse="1"))}">{label}</a>'
+        for value,label in ARCHIVE_TYPES[1:]: body+=f'<a href="{esc(archive_url(kind=value,sort="downloads",browse="1"))}">{label}</a>'
+        return layout('Archive.org',body+'</div><p><a href="https://web.archive.org/">Wayback Machine — archived websites</a></p>')
+    params={'q':archive_query(query,kind,options),'output':'json','rows':10,'page':page,
+            'fl[]':['identifier','title','creator','mediatype','date','downloads','description','access-restricted-item']}
+    if ARCHIVE_SORTS[order][1]: params['sort[]']=ARCHIVE_SORTS[order][1]
+    result=json.loads(fetch('https://archive.org/advancedsearch.php?'+U.urlencode(params,doseq=True)))
+    if not isinstance(result.get('response'),dict):
+        raise ValueError('Archive could not run that search. Try a simpler query or clear the filters.')
+    result=result['response']
+    count=int(result.get('numFound',0))
+    nav='<div class="pager">'
+    if page>1: nav+=f'<a class="button" href="{esc(archive_url(**dict(state,page=page-1)))}">Previous</a> '
+    if page*10<count: nav+=f'<a class="button" href="{esc(archive_url(**dict(state,page=page+1)))}">Next</a>'
+    nav+='</div>'
+    body=form+f'<h2>{count:,} results</h2><p class="muted">Page {page} · {ARCHIVE_SORTS[order][0]}</p>'+nav
+    if not count: body+='<p>No matches. Try fewer filters or a shorter search.</p>'
+    for row in result.get('docs',[]):
+        ident=row.get('identifier','')
+        try: item_id(ident)
+        except ValueError: continue
+        creator=row.get('creator','')
+        if isinstance(creator,list): creator=', '.join(str(x) for x in creator[:3])
+        desc=row.get('description','')
+        if isinstance(desc,list): desc=' '.join(str(x) for x in desc)
+        desc=plain(desc)[:220]
+        body+=f'<article class="card"><img class="thumb" alt="Item cover" src="/archive/image/{esc(ident)}"><h2><a href="/archive/item/{esc(ident)}">{esc(row.get("title",ident))}</a></h2><p>{esc(creator)}</p><p class="muted">{esc(row.get("mediatype",""))} · {esc(str(row.get("date",""))[:10])} · {int(row.get("downloads",0)):,} views</p><div class="clear"></div><p>{esc(desc)}</p>'
+        if row.get('access-restricted-item') in {True,'true'}: body+='<p class="muted">Restricted item · Availability on original site</p>'
+        body+='</article>'
+    return layout('Archive.org',body+nav)
+
+
+def archive_send_buttons(identifier,filename):
+    fields=f'{csrf()}<input type="hidden" name="item" value="{esc(identifier)}"><input type="hidden" name="file" value="{esc(filename)}">'
+    body='<div class="kindle-actions">'
+    for action,label in [('send','Send to library'),('open','Send to Kindle &amp; Read')]:
+        body+=f'<form method="post" action="/archive/send">{fields}<input type="hidden" name="action" value="{action}"><button>{label}</button></form>'
+    return body+'</div>'
+
+
+def archive_item(identifier,file_format=''):
+    data=metadata(identifier);meta=data.get('metadata',{})
+    title=meta.get('title',identifier)
+    description=meta.get('description','')
+    if isinstance(description,list): description='\n'.join(str(x) for x in description)
+    description=plain(description)[:2500]
+    body=f'<img class="thumb" src="/archive/image/{esc(identifier)}"><p>{esc(description)}</p><div class="clear"></div>'
+    files=data.get('files',[])
+    text=next((f for f in files if f.get('name','').endswith('_djvu.txt') and not f.get('private')),None)
+    pdf=next((f for f in files if f.get('name','').lower().endswith('.pdf') and not f.get('private')),None)
+    documents=delivery.supported_files(data)
+    if file_format and any(f.get('format')==file_format for f in documents):
+        documents=[f for f in documents if f.get('format')==file_format]
+    if documents:
+        choices=[(f['name'],Path(f['name']).suffix[1:].upper()+' · '+f['name']+f' · {int(f.get("size",0))/1_000_000:.1f} MB') for f in documents]
+        body+=f'<form class="search-form" method="post" action="/archive/send">{csrf()}<input type="hidden" name="item" value="{esc(identifier)}">'
+        body+=select('file','Read with Kindle',choices,documents[0]['name'])
+        body+='<button name="action" value="open">Send to Kindle &amp; Read</button><button class="secondary" name="action" value="send">Send to library only</button><p class="muted">PDFs keep their magazine layout. EPUBs and supported documents are converted for Kindle. Read leaves Linux and opens the native reader.</p></form>'
+    elif meta.get('mediatype')!='collection':
+        body+='<p class="card">No public Kindle-compatible document under 250 MB is available for this item. Borrowing and restricted files must be accessed on Archive.org.</p>'
+    body+=f'<p><a href="https://archive.org/details/{U.quote(identifier)}">Open original Archive.org item</a></p><h2>Available files</h2><ul>'
+    # Collection and metadata links let readers continue browsing naturally.
+    body=body.removesuffix('<h2>Available files</h2><ul>')
+    if meta.get('mediatype')=='collection':
+        body+=f'<p><a class="button" href="{esc(archive_url(collection=identifier,browse="1",sort="downloads"))}">Browse this collection</a></p>'
+    for key,label in [('creator','Creator'),('date','Published'),('publisher','Publisher'),('language','Language'),('subject','Subjects'),('collection','Collections')]:
+        values=meta.get(key,[])
+        if not isinstance(values,list): values=[values]
+        links=[]
+        for value in values[:15]:
+            if key in {'creator','language','subject','collection'}:
+                links.append(f'<a href="{esc(archive_url(**{key:str(value),"browse":"1"}))}">{esc(value)}</a>')
+            else: links.append(esc(value))
+        if links: body+=f'<div class="facts"><strong>{label}:</strong> '+', '.join(links)+'</div>'
+    public_files=[f for f in files if f.get('name') and not f.get('private')]
+    formats=sorted({str(f.get('format','Other')) for f in public_files})
+    if file_format not in formats and file_format!='all': file_format=''
+    body+='<h2>Files · Send to Kindle</h2><p>Use the send buttons for your Kindle library or native reader. “Save original” uses the browser’s download dialog.</p>'
+    format_choices=([('','Kindle documents'),('all','All files')] if documents else [('','All formats')])+[(f,f) for f in formats]
+    body+=f'<form action="/archive/item/{esc(identifier)}">'+select('format','File format',format_choices,file_format)+'<button>Show files</button></form><ul>'
+    sendable={f['name'] for f in delivery.supported_files(data)}
+    visible=[f for f in public_files if (file_format=='all' or (not file_format and (not documents or f['name'] in sendable)) or f.get('format','Other')==file_format)]
+    for file in visible[:150]:
+        name=file.get('name','')
+        if not name or file.get('private'): continue
+        url='https://archive.org/download/'+U.quote(identifier)+'/'+U.quote(name,safe='/')
+        size=int(file.get('size',0))
+        size_label=f'{size/1_000_000:.1f} MB' if size>=1_000_000 else f'{size/1000:.0f} KB'
+        body+=f'<li class="facts"><strong>{esc(name)}</strong><br><span class="muted">{esc(file.get("format",""))} · {size_label}</span>'
+        if any(f['name']==name for f in documents):body+=archive_send_buttons(identifier,name)
+        body+=f'<p><a href="{esc(url)}">Save original · browser download</a></p></li>'
+    body+='</ul>'
+    if len(visible)>150: body+='<p>Showing the first 150 files. Choose a format to narrow the list.</p>'
+    reviews=data.get('reviews',[])
+    if reviews:
+        body+='<h2>Reviews</h2>'
+        for review in reviews[:5]:
+            body+=f'<article class="card"><strong>{esc(review.get("reviewtitle","Review"))}</strong><p>{esc(plain(review.get("reviewbody",""))[:1500])}</p></article>'
+    return layout(str(title),body)
+
+
+def archive_text(identifier,page=1):
+    data=metadata(identifier)
+    file=next((f for f in data.get('files',[]) if f.get('name','').endswith('_djvu.txt') and not f.get('private')),None)
+    if not file: raise ValueError('No public text preview is available. Open the original Archive.org item.')
+    path=STATE/'cache'/('text-'+identifier+'.txt')
+    if not path.exists():
+        path.write_bytes(fetch('https://archive.org/download/'+U.quote(identifier)+'/'+U.quote(file['name'],safe='/'),15_000_000))
+    text=path.read_text(errors='replace');length=6500
+    total=max(1,(len(text)+length-1)//length)
+    page=max(1,min(page,total));part=text[(page-1)*length:page*length]
+    nav=f'<p><a href="/archive/item/{esc(identifier)}">Item details</a> · '
+    if page>1: nav+=f'<a href="?page={page-1}">Previous</a> · '
+    if page*length<len(text): nav+=f'<a href="?page={page+1}">Next</a>'
+    nav+='</p>'
+    jump=f'<form class="jump"><label>Text page {page} of {total}<input type="number" name="page" min="1" max="{total}" value="{page}"></label><button>Go</button></form>'
+    actions=archive_send_buttons(identifier,file['name']) if any(f['name']==file['name'] for f in delivery.supported_files(data)) else ''
+    return layout(str(data.get('metadata',{}).get('title',identifier)),nav+actions+jump+'<div class="content">'+esc(part)+'</div>'+nav)
+
+
+def reader_layout(title,body):
+    page=layout(title,body)
+    page=re.sub(r'<nav>.*?</nav>','',page,count=1,flags=re.S)
+    page=page.replace(f'<h1>{esc(title)}</h1>','',1)
+    css='body{max-width:none;margin:12px auto;padding:0 16px}.readerbar a{display:inline-block;min-height:76px;padding:16px 20px;margin:4px;border:3px solid #111;text-decoration:none;font-weight:bold;box-sizing:border-box}.reader-title{font-size:26px;margin:8px 0}.view-image{display:block;max-width:none;height:auto;margin:12px 0}.reader-options{border:3px solid #111;padding:12px}.jump{margin:4px 0}.jump label{font-size:26px}.jump input{min-height:72px}.reader-status{font-size:24px}.readerbar{background:white}'
+    return page.replace('</style>',css+'</style>',1)
+
+
+def display_options(get,default='photo'):
+    style=get('style',default);contrast=get('contrast','normal')
+    return dict(style=style if style in eink.STYLES else default,
+                contrast=contrast if contrast in eink.CONTRAST else 'normal',
+                invert=1 if get('invert')=='1' else 0,
+                zoom=int(get('zoom','100')) if get('zoom','100') in {'100','150','200'} else 100,
+                fit='page' if get('fit')=='page' else 'width',
+                crop=get('crop') if get('crop') in {'left','right'} else 'full')
+
+
+def display_controls(path,state,show=False):
+    def url(**changes):return path+'?'+U.urlencode(dict(state,**changes))
+    bar='<div class="readerbar">'
+    for label,changes in [('Fit width',dict(zoom=100,fit='width')),('Fit page',dict(zoom=100,fit='page')),
+                          ('Zoom −',dict(zoom=max(100,state['zoom']-50),fit='width')),('Zoom +',dict(zoom=min(200,state['zoom']+50),fit='width')),
+                          ('Display options',dict(options=0 if show else 1))]:
+        bar+=f'<a href="{esc(url(**changes))}">{label}</a>'
+    bar+='</div>'
+    if show:
+        bar+=f'<form class="reader-options" action="{esc(path)}">'
+        for key,value in state.items():
+            if key not in {'style','contrast','invert','crop'}:bar+=f'<input type="hidden" name="{key}" value="{esc(value)}">'
+        bar+=select('style','Display style',[('photo','Photo · shaded halftone'),('crisp','Crisp · text and scans'),('comic','Comic · strong black lines'),('original','Original · unprocessed tones')],state['style'])
+        bar+=select('contrast','Contrast',[('soft','Soft'),('normal','Balanced'),('strong','Strong')],state['contrast'])
+        bar+=select('invert','Paper / ink', [('0','Black ink on white'),('1','White ink on black')],str(state['invert']))
+        if path.startswith('/archive/'):
+            bar+=select('crop','Magazine spread',[('full','Whole page'),('left','Left half'),('right','Right half')],state['crop'])
+        bar+='<button>Apply display settings</button></form>'
+    return bar
+
+
+def pdf_file(identifier,name=''):
+    data=metadata(identifier)
+    files=[f for f in data.get('files',[]) if f.get('name','').lower().endswith('.pdf') and not f.get('private')]
+    file=next((f for f in files if f['name']==name),None) if name else next(iter(files),None)
+    if not file or int(file.get('size',0))>250_000_000:raise ValueError('Choose a public PDF smaller than 250 MB.')
+    return data,file
+
+
+def pdf_paths(identifier,file):
+    key=identifier+'-'+hashlib.sha256(file['name'].encode()).hexdigest()[:12]
+    return key,STATE/'cache'/('pdf-'+key+'.pdf')
+
+
+def pdf_image(identifier,page,file_name='',**options):
+    _,file=pdf_file(identifier,file_name);key,pdf=pdf_paths(identifier,file)
+    with PDF_LOCK:
+        if not pdf.exists():
+            url='https://archive.org/download/'+U.quote(identifier)+'/'+U.quote(file['name'],safe='/')
+            tmp=pdf.with_suffix('.part')
+            try:
+                request=R.Request(url,headers={'User-Agent':'Cyberdeck reader/1.0'})
+                with R.urlopen(request,timeout=45) as response,tmp.open('wb') as output:
+                    count=0
+                    while chunk:=response.read(256*1024):
+                        count+=len(chunk)
+                        if count>250_000_000:raise ValueError('This PDF exceeds the lightweight reader limit.')
+                        output.write(chunk)
+                os.replace(tmp,pdf)
+            finally:tmp.unlink(missing_ok=True)
+        info=pdf.with_suffix('.json')
+        if not info.exists():
+            result=subprocess.run(['pdfinfo',str(pdf)],capture_output=True,text=True,timeout=15)
+            match=re.search(r'^Pages:\s+(\d+)',result.stdout,re.M)
+            if match:info.write_text(json.dumps({'pages':int(match[1])}))
+        if info.exists() and page>json.loads(info.read_text())['pages']:raise ValueError('That is beyond the last page. Use Previous to return.')
+        image=STATE/'cache'/f'scan-{key}-{page}.png'
+        if not image.exists():
+            result=subprocess.run(['pdftoppm','-f',str(page),'-l',str(page),'-singlefile','-scale-to-x','2400','-scale-to-y','-1','-png',str(pdf),str(image.with_suffix(''))],capture_output=True,timeout=60)
+            if result.returncode or not image.exists():raise ValueError('This PDF page could not be rendered.')
+    return processed(image,options)
+
+
+def processed(source,options):
+    settings={key:options.get(key,default) for key,default in [('style','photo'),('contrast','normal'),('invert',0),('crop','full')]}
+    settings['width']=int(1200*int(options.get('zoom',100))/100)
+    digest=hashlib.sha256((str(source)+json.dumps(settings,sort_keys=True)+':eink-v1').encode()).hexdigest()
+    path=STATE/'cache'/('eink-'+digest+'.png')
+    if not path.exists():
+        data=eink.convert(source,**settings)
+        tmp=path.with_suffix('.'+secrets.token_hex(4)+'.tmp');tmp.write_bytes(data);os.replace(tmp,path)
+    return path.read_bytes()
+
+
+def archive_reader(identifier,page,get):
+    data,file=pdf_file(identifier,get('file'))
+    opts=display_options(get,'crisp');key,pdf=pdf_paths(identifier,file)
+    total=None
+    if pdf.with_suffix('.json').exists():total=json.loads(pdf.with_suffix('.json').read_text()).get('pages')
+    if total:page=min(page,total)
+    path='/archive/pages/'+identifier;state=dict(opts,page=page,file=file['name'])
+    def url(**changes):return path+'?'+U.urlencode(dict(state,**changes))
+    nav=f'<div class="readerbar"><a href="/archive/item/{esc(identifier)}">Back to item</a>'
+    if page>1:nav+=f'<a href="{esc(url(page=page-1))}">← Previous page</a>'
+    if not total or page<total:nav+=f'<a href="{esc(url(page=page+1))}">Next page →</a>'
+    nav+='</div>'
+    title=str(data.get('metadata',{}).get('title',identifier))
+    body=nav+f'<p class="reader-title">{esc(title)} · Page {page}'+(f' of {total}' if total else '')+'</p>'
+    if any(f['name']==file['name'] for f in delivery.supported_files(data)):
+        body+=archive_send_buttons(identifier,file['name'])+'<p>Read opens the native Kindle reader and closes Linux.</p>'
+    body+=display_controls(path,state,get('options')=='1')
+    body+=f'<form class="jump" action="{path}">'
+    for key,value in state.items():
+        if key!='page':body+=f'<input type="hidden" name="{key}" value="{esc(value)}">'
+    body+=f'<label>Page<input name="page" type="number" min="1" value="{page}"></label><button>Go</button></form>'
+    image_url='/archive/scan/'+identifier+'?'+U.urlencode(state)
+    image_style=f'width:{opts["zoom"]}%;' if opts['fit']=='width' else 'width:auto;max-width:100%;max-height:900px;'
+    body+=f'<a href="{esc(url(zoom=150 if opts["zoom"]==100 else 200 if opts["zoom"]==150 else 100,fit="width"))}"><img class="view-image" alt="Magazine / PDF page" style="{image_style}" src="{esc(image_url)}"></a>'
+    body+='<p class="reader-status">Tap the page to zoom. Swipe to pan. First opening downloads the PDF on the host.</p>'+nav
+    (STATE/'cache'/('reading-'+identifier+'.json')).write_text(json.dumps(state))
+    return reader_layout(title,body)
+
+
+def archive_transfer(job_id,open_after):
+    def update(state,message,destination=None):
+        with db() as con:
+            if destination is None:con.execute('UPDATE archive_jobs SET state=?,message=? WHERE id=?',(state,message,job_id))
+            else:con.execute('UPDATE archive_jobs SET state=?,message=?,destination=? WHERE id=?',(state,message,destination,job_id))
+    try:
+        with db() as con:job=con.execute('SELECT * FROM archive_jobs WHERE id=?',(job_id,)).fetchone()
+        data=metadata(job['item']);files=delivery.supported_files(data)
+        file=next((f for f in files if f['name']==job['file']),None)
+        if not file:raise ValueError('This public document is no longer available.')
+        update('working','Downloading from Archive…')
+        source=delivery.download(job['item'],file,STATE/'archive-downloads')
+        update('working','Preparing and copying to your Kindle…')
+        author=data.get('metadata',{}).get('creator','')
+        if isinstance(author,list):author=', '.join(str(x) for x in author[:3])
+        destination=delivery.prepare_and_deliver(source,job['title'],str(author))
+        update('working' if open_after else 'sent','Saved in your Kindle library.',destination)
+        if open_after:
+            update('working','Indexing for the native reader. Linux will close when ready.')
+            delivery.open_reader(destination)
+            update('sent','Opening in the Kindle reader.',destination)
+    except Exception as exc:update('error',str(exc))
+
+
+def archive_job(job_id):
+    with db() as con:job=con.execute('SELECT * FROM archive_jobs WHERE id=?',(job_id,)).fetchone()
+    if not job:raise ValueError('Transfer not found.')
+    pending=job['state'] in {'queued','working'}
+    body=f'<article class="card"><h2>{esc(job["title"])}</h2><p>{esc(job["message"])}</p></article>'
+    if job['destination']:body+='<p>Saved as '+esc(Path(job['destination']).name)+'</p>'
+    body+=f'<p><a class="button" href="/archive/item/{esc(job["item"])}">Back to item</a></p>'
+    if job['destination'] and not pending:
+        body+=f'<form action="/archive/open" method="post">{csrf()}<input type="hidden" name="job" value="{esc(job_id)}"><button>Read on Kindle</button></form>'
+    return layout('Send to Kindle',body,pending)
+
+
+def lichess_page(message=''):
+    name=LICHESS_LOGIN.saved().get('username','')
+    body='<p>Native touch chess on your Kindle, connected directly to Lichess.</p>'
+    if message:body+=f'<p class="card">{esc(message)}</p>'
+    if name:
+        body+=f'<p>Connected account: <strong>{esc(name)}</strong></p><form method="post" action="/lichess/deliver">{csrf()}<button>Send login to Kindle</button></form><p>Open Games → Lichess on the Kindle. The login screen picks up your account automatically.</p>'
+    body+=f'<form method="post" action="/lichess/connect">{csrf()}<button>{"Change account" if name else "Sign in with Lichess"}</button></form>'
+    body+='<p>Approve only “Play games with the Board API.” Your password stays with Lichess. The access token is stored privately on this computer and sent to your Kindle over SSH.</p><p>Play uses the native chess app. This page is only for connecting your account.</p>'
+    return layout('Lichess · Connect account',body)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,*_): pass
+
+    def send(self,body,kind='text/html; charset=utf-8',status=200):
+        data=body.encode() if isinstance(body,str) else body
+        self.send_response(status);self.send_header('Content-Type',kind)
+        self.send_header('Content-Length',str(len(data)))
+        self.send_header('X-Content-Type-Options','nosniff')
+        if self.path.startswith('/lichess'):
+            self.send_header('Cache-Control','no-store')
+            self.send_header('Referrer-Policy','no-referrer')
+        self.end_headers();self.wfile.write(data)
+
+    def redirect(self,path):
+        self.send_response(303);self.send_header('Location',path);self.end_headers()
+
+    def do_GET(self):
+        url=U.urlsplit(self.path);path=U.unquote(url.path);query=U.parse_qs(url.query)
+        get=lambda key,default='':query.get(key,[default])[0]
+        try:
+            if path=='/lichess':return self.send(lichess_page())
+            if path=='/lichess/callback':
+                try:
+                    name=LICHESS_LOGIN.complete(get('state'),get('code'),get('error'))
+                    try:
+                        LICHESS_LOGIN.deliver();message=f'Signed in as {name}. Login delivered to the Kindle.'
+                    except ValueError as exc:message=str(exc)
+                    return self.send(lichess_page(message))
+                except ValueError as exc:return self.send(lichess_page(str(exc)),status=400)
+                except Exception:return self.send(lichess_page('Lichess sign-in could not finish. Please start again.'),status=502)
+            if path=='/health': return self.send('{"app":"kindle-hub","ok":true,"build":"touch-v3"}','application/json')
+            if path=='/home': return self.send(layout('Cyberdeck', '<a class="tile" href="/chat">Chat</a><a class="tile" href="/archive">Archive · Books & Magazines</a><p>Use the large browser toolbar for Back, Home, Keyboard and scrolling tools.</p>'))
+            if path in {'/','/chat'}: return self.send(chat_home())
+            if path=='/chats': return self.send(layout('Chat history','<div class="history">'+chat_links()+'</div>'))
+            if path.startswith('/chat/'): return self.send(chat_page(path.rsplit('/',1)[1]))
+            if path=='/archive': return self.send(archive_search(get('q'),get('kind','all'),max(1,min(100,int(get('page','1')))),**{key:get(key) for key in ARCHIVE_FIELDS}))
+            if path.startswith('/archive/job/'):return self.send(archive_job(path.rsplit('/',1)[-1]))
+            for prefix,kind in [('/archive/item/','item'),('/archive/read/','read'),('/archive/pages/','pages'),('/archive/scan/','scan'),('/archive/image/','image')]:
+                if not path.startswith(prefix): continue
+                ident=item_id(path[len(prefix):]);page=max(1,min(10000,int(get('page','1'))))
+                if kind=='item': return self.send(archive_item(ident,get('format')))
+                if kind=='read': return self.send(archive_text(ident,page))
+                if kind=='scan': return self.send(pdf_image(ident,page,get('file'),**display_options(get,'crisp')),'image/png')
+                if kind=='image': return self.send(fetch('https://archive.org/services/img/'+U.quote(ident),5_000_000),'image/jpeg')
+                if kind=='pages': return self.send(archive_reader(ident,page,get))
+            self.send(layout('Not found','<p>That page does not exist.</p>'),status=404)
+        except Exception as exc:
+            back='/archive'
+            self.send(layout('Could not open that page',f'<p>{esc(exc)}</p><p><a class="button" href="{back}">Back to browsing</a></p>'),status=502)
+
+    def do_POST(self):
+        try:
+            length=int(self.headers.get('Content-Length','0'))
+            if not 0<length<=32768: raise ValueError('Message is too large.')
+            form=U.parse_qs(self.rfile.read(length).decode())
+            get=lambda key,default='':form.get(key,[default])[0]
+            if not secrets.compare_digest(get('csrf'),TOKEN): return self.send('Invalid form token.',status=403)
+            if self.path=='/lichess/connect':return self.redirect(LICHESS_LOGIN.begin())
+            if self.path=='/lichess/deliver':
+                try:
+                    name=LICHESS_LOGIN.deliver();message=f'Login for {name} delivered. Open Games → Lichess on the Kindle.'
+                except ValueError as exc:message=str(exc)
+                return self.send(lichess_page(message))
+            if self.path=='/archive/send':
+                ident=item_id(get('item'));data=metadata(ident)
+                file=next((f for f in delivery.supported_files(data) if f['name']==get('file')),None)
+                if not file:raise ValueError('Choose an available public document.')
+                title=str(data.get('metadata',{}).get('title',ident));job_id=secrets.token_hex(10)
+                with db() as con:con.execute('INSERT INTO archive_jobs VALUES(?,?,?,?,?,?,?)',(job_id,ident,file['name'],title,'queued','Starting transfer…',''))
+                POOL.submit(archive_transfer,job_id,get('action')=='open')
+                return self.redirect('/archive/job/'+job_id)
+            if self.path=='/archive/open':
+                job_id=get('job')
+                with db() as con:job=con.execute('SELECT * FROM archive_jobs WHERE id=?',(job_id,)).fetchone()
+                if not job or not job['destination']:raise ValueError('Send the document first.')
+                def open_existing():
+                    try:
+                        delivery.open_reader(job['destination']);message='Opening in the Kindle reader.';state='sent'
+                    except Exception as exc:message=str(exc);state='error'
+                    with db() as con:con.execute('UPDATE archive_jobs SET state=?,message=? WHERE id=?',(state,message,job_id))
+                with db() as con:con.execute("UPDATE archive_jobs SET state='working',message='Opening native reader…' WHERE id=?",(job_id,))
+                POOL.submit(open_existing)
+                return self.redirect('/archive/job/'+job_id)
+            if self.path=='/new':
+                provider=get('provider','fm')
+                if provider not in {'fm','ollama'}: raise ValueError('Invalid provider.')
+                ident=secrets.token_hex(10)
+                with db() as con: con.execute('INSERT INTO chats VALUES(?,?,?,?)',(ident,'New conversation',provider,time.time()))
+                return self.redirect('/chat/'+ident+'#compose')
+            if self.path=='/send':
+                ident=get('chat_id');message=get('message').strip()[:4000]
+                if not message: raise ValueError('Enter a message.')
+                with LOCK,db() as con:
+                    chat=con.execute('SELECT * FROM chats WHERE id=?',(ident,)).fetchone()
+                    if not chat: raise ValueError('Conversation not found.')
+                    if con.execute("SELECT 1 FROM messages WHERE chat_id=? AND status='pending'",(ident,)).fetchone():
+                        return self.redirect('/chat/'+ident)
+                    con.execute('INSERT INTO messages(chat_id,role,content,status) VALUES(?,?,?,?)',(ident,'user',message,'done'))
+                    if chat['title']=='New conversation': con.execute('UPDATE chats SET title=? WHERE id=?',(message[:55],ident))
+                    cur=con.execute('INSERT INTO messages(chat_id,role,content,status) VALUES(?,?,?,?)',(ident,'assistant','','pending'))
+                    message_id=cur.lastrowid
+                POOL.submit(answer,ident,message_id)
+                return self.redirect('/chat/'+ident)
+            self.send('Not found',status=404)
+        except Exception as exc: self.send(layout('Could not submit',f'<p>{esc(exc)}</p>'),status=400)
+
+
+def healthy():
+    try:
+        with R.urlopen(BASE+'/health',timeout=1) as response: return json.load(response).get('app')=='kindle-hub'
+    except OSError: return False
+
+
+def ensure():
+    if healthy(): return
+    STATE.mkdir(parents=True,exist_ok=True)
+    with open(STATE/'server.log','ab',buffering=0) as log:
+        subprocess.Popen([sys.executable,__file__,'serve'],stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
+    for _ in range(30):
+        if healthy(): return
+        time.sleep(0.2)
+    raise RuntimeError('The private Kindle hub did not start.')
+
+
+def main():
+    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['serve','ensure','url']);parser.add_argument('page',nargs='?',default='chat');args=parser.parse_args()
+    os.umask(0o077)
+    if args.action=='serve':
+        init();server=ThreadingHTTPServer(('127.0.0.1',PORT),Handler)
+        (STATE/'server.pid').write_text(str(os.getpid()))
+        server.serve_forever()
+    else:
+        ensure()
+        if args.action=='url': print(BASE+'/'+(args.page if args.page in {'archive','lichess'} else 'chat'))
+
+
+if __name__=='__main__': main()

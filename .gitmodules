@@ -1,0 +1,3 @@
+[submodule "vendor/alpine-kindle"]
+	path = vendor/alpine-kindle
+	url = https://github.com/adiglase/alpine-kindle.git

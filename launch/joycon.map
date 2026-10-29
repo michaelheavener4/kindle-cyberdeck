@@ -1,0 +1,16 @@
+# Linux evdev code, then action. A learned map at joycon/map replaces this.
+# These are the codes a Joy-Con gets when the kernel treats it as a gamepad.
+304 b
+305 a
+307 x
+308 y
+310 l
+311 r
+312 zl
+313 zr
+314 minus
+315 plus
+544 up
+545 down
+546 left
+547 right

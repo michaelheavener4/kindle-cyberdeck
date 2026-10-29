@@ -1,0 +1,262 @@
+#!/bin/sh
+# Launch a Game Boy ROM under mGBA. Battery saves go in /mnt/kindle/gb/saves.
+# Pokemon Red is the file pokemon-red.gb in that folder. This script does not
+# fetch ROMs.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export SDL_AUDIODRIVER=dummy
+export SDL_VIDEODRIVER=x11
+
+GB=/mnt/kindle/gb
+SAVES=$GB/saves
+ZIP=/mnt/kindle/linux/gb/mgba-apks.zip
+LOG=/mnt/kindle/linux/gb.log
+SOFTWARE=/usr/local/lib/libkindle-sdl-software.so
+mpid=
+ppid=
+menu_window=
+
+say() {
+	printf '%s\n' "$*"
+	printf '%s\n' "$*" >>"$LOG" 2>/dev/null
+}
+
+gb_pid_file=/tmp/kindle-gb.pid
+
+cleanup() {
+	rm -f "$gb_pid_file"
+	if [ -n "$mpid" ] && kill -0 "$mpid" 2>/dev/null; then
+		xdotool search --pid "$mpid" windowclose >/dev/null 2>&1 || true
+		sleep 1
+		kill "$mpid" 2>/dev/null || true
+	fi
+	if [ -n "$ppid" ] && kill -0 "$ppid" 2>/dev/null; then
+		kill "$ppid" 2>/dev/null || true
+	fi
+	restore_menu
+}
+trap cleanup INT TERM
+
+restore_menu() {
+	if [ -n "$menu_window" ]; then
+		xdotool windowmap "$menu_window" windowactivate "$menu_window" >/dev/null 2>&1 || true
+		menu_window=
+	fi
+}
+
+need_rom_help() {
+	say "No Game Boy ROM in $GB"
+	say
+	say "Pokemon Red goes here, under that exact name:"
+	say "  $GB/pokemon-red.gb"
+	say
+	say "Other games can be any .gb or .gbc file in that folder."
+	say "Cartridge saves are written to:"
+	say "  $SAVES/<rom name>.sav"
+	say "A save from another emulator works if it has that name."
+	say "QUIT on the touch pad writes the save. Pulling USB does not."
+}
+
+install_mgba() {
+	command -v mgba >/dev/null && return 0
+	if [ ! -f "$ZIP" ]; then
+		say "mGBA packages are missing: $ZIP"
+		return 1
+	fi
+	say "Installing mGBA. This happens once and takes a minute."
+	stage=/tmp/gb-apks
+	rm -rf "$stage"
+	mkdir -p "$stage/armv7"
+	unzip -q -o "$ZIP" -d "$stage/armv7" || {
+		say "Could not unpack $ZIP"
+		return 1
+	}
+	apk index -o "$stage/armv7/APKINDEX.tar.gz" "$stage"/armv7/*.apk || {
+		say "Could not index the mGBA packages."
+		return 1
+	}
+	if apk add --no-network --allow-untrusted --repository "$stage" mgba >>"$LOG" 2>&1; then
+		say "mGBA installed."
+		return 0
+	fi
+	say "Offline install failed. Last lines:"
+	tail -n 20 "$LOG"
+	return 1
+}
+
+find_red() {
+	for f in "$GB"/pokemon-red.gb "$GB"/pokered.gb "$GB"/Pokemon\ Red.gb; do
+		if [ -f "$f" ]; then
+			printf '%s\n' "$f"
+			return 0
+		fi
+	done
+	for f in "$GB"/*.gb "$GB"/*.gbc "$GB"/*.GB "$GB"/*.GBC; do
+		[ -f "$f" ] || continue
+		low=$(printf '%s' "$(basename "$f")" | tr '[:upper:]' '[:lower:]')
+		case "$low" in
+		*pokemon*red*|pokered*)
+			printf '%s\n' "$f"
+			return 0
+			;;
+		esac
+	done
+	return 1
+}
+
+list_roms() {
+	find "$GB" -maxdepth 1 -type f \( -iname '*.gb' -o -iname '*.gbc' \) | sort
+}
+
+pick_scale() {
+	geom=$(xwininfo -root 2>/dev/null | awk '/-geometry/{print $2; exit}')
+	w=${geom%%x*}
+	h=${geom#*x}
+	h=${h%%+*}
+	case "$w$h" in
+	''|*[!0-9]*) w=1272; h=1696 ;;
+	esac
+	s=6
+	while [ "$s" -ge 3 ]; do
+		gw=$((160 * s))
+		gh=$((144 * s))
+		if [ "$gw" -le $((w - 16)) ] && [ "$gh" -le $((h * 52 / 100)) ]; then
+			printf '%s\n' "$s"
+			return 0
+		fi
+		s=$((s - 1))
+	done
+	printf '%s\n' 3
+}
+
+play() {
+	rom=$1
+	[ -f "$rom" ] || {
+		say "ROM not found: $rom"
+		return 1
+	}
+	mkdir -p "$SAVES" || {
+		say "Could not create $SAVES"
+		return 1
+	}
+	install_mgba || return 1
+	if [ -f /mnt/kindle/linux/gb/libkindle-sdl-software.so ]; then
+		mkdir -p /usr/local/lib
+		cp /mnt/kindle/linux/gb/libkindle-sdl-software.so "$SOFTWARE" || return 1
+	fi
+	if [ ! -f "$SOFTWARE" ]; then
+		say "Missing Kindle software renderer: $SOFTWARE"
+		return 1
+	fi
+	# SDL cannot draw into Xephyr's default 8-bit window. Its 32-bit
+	# TrueColor visual can be rendered in software onto the e-ink desktop.
+	visual=$(xdpyinfo 2>/dev/null | awk '
+		/visual id:/ { id=$NF }
+		/class:/ { class=$NF }
+		/depth:/ && $2 == 32 && class == "TrueColor" { print id; exit }
+	')
+	if [ -z "$visual" ]; then
+		say "No 32-bit TrueColor visual is available for the game."
+		return 1
+	fi
+	export SDL_VIDEO_X11_WINDOW_VISUALID=$((visual))
+	base=$(basename "$rom")
+	stem=${base%.*}
+	sav=$SAVES/$stem.sav
+	if [ ! -f "$sav" ] && [ -f "$GB/$stem.sav" ]; then
+		cp "$GB/$stem.sav" "$sav"
+		say "Copied an existing save to $sav"
+	fi
+	scale=$(pick_scale)
+	say "ROM: $rom"
+	say "Cartridge save: $sav"
+	say "Touch pad: directions, B, A, Select, Start."
+	say "A Joy-Con uses the same buttons. Plus is Start, Minus is Select, ZR is fast."
+	say "QUIT on the touch pad still writes the cartridge save."
+	say "SAVE stores state 1. LOAD restores it."
+	say "QUIT closes the game and writes the cartridge save."
+	kindle-keyboard hide >/dev/null 2>&1 || true
+	menu_window=$(xdotool search --onlyvisible --name '^cyberdeck$' 2>/dev/null | head -n 1)
+	if [ -n "$menu_window" ]; then
+		xdotool windowminimize "$menu_window" >/dev/null 2>&1 || true
+	fi
+	# -N is the scale. -s is frameskip, so do not use it.
+	# dummy audio: this Paperwhite has no sound device, and mGBA exits
+	# if SDL audio fails to open.
+	LD_PRELOAD="$SOFTWARE" SDL_VIDEO_X11_WMCLASS=kindle-mgba mgba -"$scale" \
+		-C sgb.borders=0 \
+		-C savegamePath="$SAVES" \
+		-C savestatePath="$SAVES" \
+		"$rom" >>"$LOG" 2>&1 &
+	mpid=$!
+	printf '%s\n' "$mpid" >"$gb_pid_file"
+	sleep 1
+	if ! kill -0 "$mpid" 2>/dev/null; then
+		rm -f "$gb_pid_file"
+		say "mGBA exited before the window opened. Last log lines:"
+		tail -n 25 "$LOG"
+		kindle-keyboard show >/dev/null 2>&1 || true
+		restore_menu
+		return 1
+	fi
+	gb-pad "$mpid" "$scale" >>"$LOG" 2>&1 &
+	ppid=$!
+	while kill -0 "$mpid" 2>/dev/null; do
+		sleep 1
+	done
+	kill "$ppid" 2>/dev/null || true
+	wait "$mpid" 2>/dev/null || true
+	rm -f "$gb_pid_file"
+	mpid=
+	ppid=
+	kindle-keyboard show >/dev/null 2>&1 || true
+	restore_menu
+	if [ -f "$sav" ]; then
+		say "Cartridge save is $sav ($(wc -c < "$sav") bytes)."
+	else
+		say "No cartridge save yet. Use the in-game SAVE, then QUIT."
+	fi
+}
+
+mkdir -p "$GB" "$SAVES" "$(dirname "$LOG")" 2>/dev/null || true
+: >>"$LOG" 2>/dev/null
+
+mode=$1
+case "$mode" in
+pokemon-red|"")
+	rom=$(find_red) || {
+		need_rom_help
+		exit 1
+	}
+	play "$rom"
+	;;
+pick)
+	roms=$(list_roms)
+	if [ -z "$roms" ]; then
+		need_rom_help
+		exit 1
+	fi
+	say "Game Boy ROMs:"
+	n=0
+	# POSIX has no arrays. Number the list, then pick the Nth file.
+	printf '%s\n' "$roms" | while IFS= read -r f; do
+		n=$((n + 1))
+		printf '  %s  %s\n' "$n" "$(basename "$f")"
+	done
+	printf 'Number: '
+	read -r choice
+	rom=$(printf '%s\n' "$roms" | awk -v n="$choice" 'NR == n { print; exit }')
+	if [ -z "$rom" ] || [ ! -f "$rom" ]; then
+		say "No such ROM."
+		exit 1
+	fi
+	play "$rom"
+	;;
+*)
+	if [ -f "$mode" ]; then
+		play "$mode"
+	else
+		say "usage: deck-gb pokemon-red | pick | /path/to/game.gb"
+		exit 1
+	fi
+	;;
+esac

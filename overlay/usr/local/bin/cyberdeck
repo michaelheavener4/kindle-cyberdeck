@@ -1,0 +1,231 @@
+#!/bin/bash
+# Text menu. Each item runs one command. Entries without a working remote
+# command say so instead of pretending to connect.
+# Up and Down move the marker. A or Enter runs it. A letter still jumps there.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+cd "$HOME" || exit 1
+. /usr/local/bin/deck-net
+
+pause() {
+	echo
+	printf 'Press Enter. '
+	read -r _
+}
+
+set_menu() {
+	menu=$1
+	sel=0
+	case "$menu" in
+	home) items=("1|Personal" "2|Games" "3|Dev" "4|Settings" "0|Close this menu") ;;
+	personal) items=("a|Chat" "b|Books" "h|Archive.org" "j|Journal" "8|Files on the Kindle" "0|Back") ;;
+	games)
+		items=("p|Pokemon Red" "g|Game Boy" "c|Chess offline" "o|Lichess online")
+		[ ! -x /usr/local/bin/deck-joycon ] || items+=("y|Joy-Con")
+		items+=("0|Back")
+		;;
+	dev) items=("t|Instrument panel" "1|Terminal" "2|Codex" "3|Grok" "4|OpenCode"
+		"5|Omarchy shell" "6|MacBook shell" "f|Mac FM AI" "l|Mac local AI" "d|Omarchy screen" "0|Back") ;;
+	settings) items=("r|Display orientation" "s|Font size" "k|Show / hide keyboard" "7|Tailscale login" "9|SSH key" "0|Back") ;;
+	esac
+}
+set_menu home
+
+choose() {
+	if [ "$menu" = home ]; then
+		case "$1" in
+		1) set_menu personal ;;
+		2) set_menu games ;;
+		3) set_menu dev ;;
+		4) set_menu settings ;;
+		0) exit 0 ;;
+		esac
+	elif [ "$1" = 0 ]; then
+		set_menu home
+	else
+		run_choice "$1"
+	fi
+}
+
+run_choice() {
+	case "$1" in
+	t|T) deck-instruments ;;
+	1) bash ;;
+	2) deck-connect omarchy codex 'exec codex' ;;
+	3) deck-connect omarchy grok 'exec grok' ;;
+	4) deck-connect omarchy opencode 'exec opencode' ;;
+	5) deck-connect omarchy kindle ;;
+	6) deck-connect mac kindle ;;
+	b|B) deck-books ;;
+	a|A) deck-web chat ;;
+	h|H) deck-web archive ;;
+	f|F) deck-mac-ai fm ;;
+	l|L) deck-mac-ai local ;;
+	r|R) deck-orientation ;;
+	s|S) kindle-font ;;
+	k|K) kindle-keyboard toggle ;;
+	7)
+		clear 2>/dev/null || true
+		echo "TAILSCALE"
+		echo
+		echo "Starting now. Lines will keep appearing."
+		echo "A login URL follows if this Kindle is not on the tailnet yet."
+		echo
+		if ! deck_net_prepare; then
+			echo
+			echo "Tailscale did not start."
+			echo "After you leave Linux, the log is linux/tailscale.log on the Kindle."
+			pause
+			return
+		fi
+		echo
+		if "$TC" --socket="$SOCK" status >/dev/null 2>&1; then
+			echo "This Kindle is already on the tailnet."
+			echo
+			"$TC" --socket="$SOCK" status
+		else
+			echo "Contacting Tailscale."
+			echo "When a URL appears, open it in a browser and approve kindle."
+			echo
+			deck_net_login
+		fi
+		;;
+	8)
+		echo "/mnt/kindle is the Kindle userstore."
+		echo
+		ls -la /mnt/kindle 2>/dev/null || echo "The userstore is not mounted inside Alpine."
+		;;
+	9)
+		if [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
+			cat "$HOME/.ssh/id_ed25519.pub"
+			echo
+			echo "Omarchy is meant to trust this key already."
+			echo "The Mac still needs this line in its authorized_keys."
+		else
+			echo "No key in ~/.ssh/id_ed25519.pub"
+		fi
+		;;
+	d|D)
+		echo "Opening the Omarchy screen."
+		echo "A new picture is tried every few seconds. A repeat is left alone."
+		deck-display
+		;;
+	j|J)
+		echo "Opening the journal."
+		echo "The on-screen keyboard works. A USB keyboard is tried as well."
+		field-notes
+		;;
+	c|C)
+		echo "Opening chess."
+		echo "Tap a piece, then tap the square it moves to."
+		echo "Lichess is also available under Games → Lichess online."
+		deck-chess
+		;;
+	o|O) deck-chess --lichess ;;
+	p|P) deck-gb pokemon-red ;;
+	g|G) deck-gb pick ;;
+	y|Y)
+		echo "Joy-Con."
+		echo "Hold the small sync button on the rail until the lights slide."
+		echo "Pair the left, then the right. Each one is its own controller."
+		echo
+		echo "  p  Pair"
+		echo "  l  Learn buttons, if one does the wrong thing"
+		echo
+		printf 'Pair or learn: '
+		read -r which
+		case "$which" in
+		l|L)
+			deck-joycon learn
+			;;
+		*)
+			deck-joycon pair
+			echo
+			echo "Pair the other Joy-Con the same way, or press Enter to stop."
+			printf 'Pair again? [y]: '
+			read -r again
+			case "$again" in
+			y|Y) deck-joycon pair ;;
+			esac
+			;;
+		esac
+		;;
+	0) exit 0 ;;
+	*) echo "No such item." ;;
+	esac
+	pause
+}
+
+draw() {
+	clear 2>/dev/null || true
+	local cols lines block=42 pad top
+	read -r lines cols < <(stty size 2>/dev/null)
+	cols=${cols:-80}; lines=${lines:-24}
+	pad=$(((cols - block) / 2)); [ "$pad" -ge 0 ] || pad=0
+	top=$(((lines - ${#items[@]} - 5) / 2)); [ "$top" -ge 0 ] || top=0
+	for ((n=0; n<top; n++)); do echo; done
+	if [ "$menu" = home ]; then
+		printf '%*sKINDLE\n' "$pad" ''
+	else
+		printf '%*sKINDLE / %s\n' "$pad" '' "${menu^^}"
+	fi
+	if [ "$lines" -ge "$((${#items[@]} + 5))" ]; then
+		echo
+		printf '%*sUp / Down to move. Enter to open.\n' "$pad" ''
+		echo
+	fi
+	local i=0
+	local key label
+	for row in "${items[@]}"; do
+		key=${row%%|*}
+		label=${row#*|}
+		if [ "$i" -eq "$sel" ]; then
+			printf '%*s > %s  %s\n' "$pad" '' "$key" "$label"
+		else
+			printf '%*s   %s  %s\n' "$pad" '' "$key" "$label"
+		fi
+		i=$((i + 1))
+	done
+	echo
+}
+
+sel=0
+trap 'draw' WINCH
+while true; do
+	draw
+	IFS= read -rsn1 key || continue
+	if [ "$key" = $'\e' ]; then
+		rest=""
+		IFS= read -rsn2 -t 0.05 rest || true
+		case "$rest" in
+		"") [ "$menu" = home ] || set_menu home ;;
+		'[A'|'OA')
+			sel=$((sel - 1))
+			[ "$sel" -lt 0 ] && sel=$((${#items[@]} - 1))
+			;;
+		'[B'|'OB')
+			sel=$((sel + 1))
+			[ "$sel" -ge ${#items[@]} ] && sel=0
+			;;
+		esac
+		continue
+	fi
+	case "$key" in
+	$'\n'|$'\r'|"")
+		choose "${items[$sel]%%|*}"
+		;;
+	*)
+		match=-1
+		i=0
+		for row in "${items[@]}"; do
+			if [ "${row%%|*}" = "$key" ]; then
+				match=$i
+				break
+			fi
+		done
+		if [ "$match" -ge 0 ]; then
+			sel=$match
+			choose "$key"
+		fi
+		;;
+	esac
+done

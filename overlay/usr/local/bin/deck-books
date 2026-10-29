@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/local/bin/deck-connect omarchy books 'exec kindle-books'

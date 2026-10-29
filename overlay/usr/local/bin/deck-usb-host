@@ -1,0 +1,275 @@
+#!/bin/sh
+# Ask the Kindle USB-C port to become a host, so a USB-C to USB-A keyboard
+# can enumerate. This is unproven on Paperwhite 6. Writes only data_role,
+# power_role, and usb_role role files. down puts the saved values back.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+SYS=${USB_SYS_ROOT:-/sys}
+
+if [ -n "${USB_HOST_LOG:-}" ]; then
+	LOG=$USB_HOST_LOG
+	STATE=${USB_HOST_STATE:-$(dirname "$LOG")/usb-host.state}
+else
+	if mkdir -p /mnt/kindle/linux 2>/dev/null && touch /mnt/kindle/linux/usb-host.log 2>/dev/null; then
+		LOG=/mnt/kindle/linux/usb-host.log
+		STATE=/mnt/kindle/linux/usb-host.state
+	else
+		LOG=/tmp/usb-host.log
+		STATE=/tmp/usb-host.state
+	fi
+fi
+
+say() {
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null || true
+}
+
+report() {
+	printf '%s\n' "$1"
+	say "$1"
+}
+
+boot_id() {
+	if [ -r /proc/sys/kernel/random/boot_id ]; then
+		tr -d '\r\n' </proc/sys/kernel/random/boot_id
+	else
+		echo unknown
+	fi
+}
+
+# Active role is the word in brackets when the file lists choices.
+current_role() {
+	raw=$(tr -d '\r\n' < "$1" 2>/dev/null) || return 1
+	case "$raw" in
+	*\[*\]*)
+		cur=${raw#*\[}
+		cur=${cur%%\]*}
+		;;
+	*) cur=$raw ;;
+	esac
+	case "$cur" in
+	host | device | source | sink | none | dual) printf '%s\n' "$cur" ;;
+	*) return 1 ;;
+	esac
+}
+
+want_for() {
+	base=$(basename "$1")
+	case "$1" in
+	*/typec/*)
+		case "$base" in
+		data_role) printf '%s\n' host ;;
+		power_role) printf '%s\n' source ;;
+		*) return 1 ;;
+		esac
+		;;
+	*/usb_role/*)
+		[ "$base" = role ] || return 1
+		printf '%s\n' host
+		;;
+	*) return 1 ;;
+	esac
+}
+
+# Role writes can block inside the driver. Give up after 8s so the journal
+# still opens. A stuck write is left running; reboot clears it.
+apply_write() {
+	path=$1
+	want=$2
+	say "write $want -> $path"
+	printf '%s\n' "$want" >"$path" &
+	wpid=$!
+	# A role write can block in the driver. Stop it after 8 seconds.
+	(
+		sleep 8
+		kill "$wpid" 2>/dev/null || true
+	) &
+	kpid=$!
+	wait "$wpid"
+	rc=$?
+	kill "$kpid" 2>/dev/null || true
+	wait "$kpid" 2>/dev/null || true
+	if [ "$rc" -ne 0 ]; then
+		say "write failed $path exit $rc"
+		return 1
+	fi
+	now=$(current_role "$path" 2>/dev/null || true)
+	say "after write $path reads ${now:-unparsed}"
+	return 0
+}
+
+dump_input() {
+	say "--- input devices ---"
+	cat /proc/bus/input/devices >>"$LOG" 2>&1 || true
+}
+
+up() {
+	say "--- up sys=$SYS ---"
+	ls -ld "$SYS/class/typec" "$SYS/class/usb_role" >>"$LOG" 2>&1 || true
+	if [ -f "$STATE" ]; then
+		tag=
+		old=
+		IFS=$(printf '\t') read -r tag old <"$STATE" || true
+		if [ "$tag" = boot ] && [ "$old" = "$(boot_id)" ]; then
+			say "state file already exists; not writing roles again"
+			dump_input
+			report "usb: already switched"
+			return 0
+		fi
+		say "ignoring usb state from another boot"
+		rm -f "$STATE"
+	fi
+
+	found=0
+	writable=0
+	unparsed=0
+	changed=0
+	failed=0
+	list=$(mktemp) || {
+		report "usb: switch failed"
+		return 1
+	}
+	: >"$list"
+
+	oldifs=$IFS
+	IFS='
+'
+	for path in $(find "$SYS/class/typec" "$SYS/class/usb_role" \
+		\( -name data_role -o -name power_role -o -name role \) 2>>"$LOG"); do
+		[ -f "$path" ] || continue
+		found=$((found + 1))
+		raw=$(tr -d '\r\n' < "$path" 2>/dev/null || true)
+		if [ -w "$path" ]; then
+			say "seen $path writable=yes content=${raw:-empty}"
+		else
+			say "seen $path writable=no content=${raw:-empty}"
+		fi
+		want=$(want_for "$path" || true)
+		if [ -z "$want" ]; then
+			say "ignored $path"
+		elif [ ! -w "$path" ]; then
+			:
+		else
+			cur=$(current_role "$path" || true)
+			case "$cur" in
+			host | device | source | sink | none | dual)
+				writable=$((writable + 1))
+				printf '%s\t%s\t%s\n' "$path" "$cur" "$want" >>"$list"
+				;;
+			*)
+				say "unparsed $path"
+				unparsed=$((unparsed + 1))
+				;;
+			esac
+		fi
+	done
+	IFS=$oldifs
+
+	if [ "$found" -eq 0 ]; then
+		rm -f "$list"
+		dump_input
+		report "usb: no role file"
+		return 0
+	fi
+	if [ "$writable" -eq 0 ]; then
+		rm -f "$list"
+		dump_input
+		if [ "$unparsed" -gt 0 ]; then
+			report "usb: switch failed"
+		else
+			report "usb: role file is read-only"
+		fi
+		return 0
+	fi
+
+	state_tmp=$(mktemp) || {
+		rm -f "$list"
+		report "usb: switch failed"
+		return 1
+	}
+	printf 'boot\t%s\n' "$(boot_id)" >"$state_tmp"
+	while IFS=$(printf '\t') read -r path cur want; do
+		[ -n "$path" ] || continue
+		printf '%s\t%s\n' "$path" "$cur" >>"$state_tmp"
+	done <"$list"
+	mv "$state_tmp" "$STATE"
+	say "saved originals in $STATE"
+
+	while IFS=$(printf '\t') read -r path cur want; do
+		[ -n "$path" ] || continue
+		if [ "$cur" = "$want" ]; then
+			say "unchanged $path is $cur"
+			continue
+		fi
+		if apply_write "$path" "$want"; then
+			changed=$((changed + 1))
+		else
+			failed=$((failed + 1))
+		fi
+	done <"$list"
+	rm -f "$list"
+
+	dump_input
+	if [ "$changed" -gt 0 ]; then
+		report "usb: switched to host"
+	elif [ "$failed" -gt 0 ]; then
+		report "usb: switch failed"
+	else
+		rm -f "$STATE"
+		say "roles were already host; removed state"
+		report "usb: already host"
+	fi
+}
+
+down() {
+	say "--- down ---"
+	if [ ! -f "$STATE" ]; then
+		report "usb: nothing to restore"
+		return 0
+	fi
+	while IFS=$(printf '\t') read -r path value; do
+		[ -n "$path" ] || continue
+		case "$path" in
+		boot | \#*) continue ;;
+		esac
+		case "$value" in
+		host | device | source | sink | none | dual) ;;
+		*)
+			say "skip bad value for $path"
+			continue
+			;;
+		esac
+		case "$path" in
+		*/typec/* | */usb_role/*) ;;
+		*)
+			say "skip path $path"
+			continue
+			;;
+		esac
+		base=$(basename "$path")
+		case "$base" in
+		data_role | power_role | role) ;;
+		*)
+			say "skip name $path"
+			continue
+			;;
+		esac
+		if [ ! -w "$path" ]; then
+			say "not writable on restore $path"
+			continue
+		fi
+		apply_write "$path" "$value" || true
+	done <"$STATE"
+	rm -f "$STATE"
+	say "removed state"
+	dump_input
+	report "usb: restored"
+}
+
+case "${1:-}" in
+up) up ;;
+down) down ;;
+*)
+	echo "usage: deck-usb-host up|down" >&2
+	exit 2
+	;;
+esac

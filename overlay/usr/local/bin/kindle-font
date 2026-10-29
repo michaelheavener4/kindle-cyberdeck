@@ -1,0 +1,18 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+size=${1:-menu}
+if [ "$size" = menu ]; then
+  printf '\nFONT SIZE\n\n1  Small (18)\n2  Standard (22)\n3  Large (26)\n4  Extra large (30)\n0  Back\n\nChoice: '
+  read -r choice
+  case "$choice" in 1) size=18 ;; 2) size=22 ;; 3) size=26 ;; 4) size=30 ;; *) exit 0 ;; esac
+fi
+case "$size" in 18|22|26|30) ;; *) exit 2 ;; esac
+mkdir -p /mnt/kindle/linux
+printf '%s\n' "$size" >/mnt/kindle/linux/font-size
+# XTerm's font escape changes this terminal without disturbing its shell/SSH.
+printf '\033]50;xft:DejaVu Sans Mono:size=%s\007' "$size"
+sleep 1
+if [ -n "${WINDOWID:-}" ]; then
+  kindle-window-fit --window "$WINDOWID"
+fi
+echo "Font size: $size"

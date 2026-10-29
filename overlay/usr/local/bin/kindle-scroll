@@ -1,0 +1,7 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+window=$(xdotool getactivewindow) || exit 1
+class=$(xprop -id "$window" WM_CLASS)
+case "${1:-down}" in up) key=Prior ;; *) key=Next ;; esac
+case "$class" in *XTerm*) key="shift+$key" ;; esac
+exec xdotool key --clearmodifiers --window "$window" "$key"

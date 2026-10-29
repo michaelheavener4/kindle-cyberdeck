@@ -1,0 +1,11 @@
+#!/bin/sh
+. /usr/local/bin/kindle-session-env
+kindle-keyboard hide >/dev/null 2>&1 || true
+mkdir -p "$HOME/.config/netsurf"
+choices="$HOME/.config/netsurf/Choices"
+[ -f "$choices" ] || : >"$choices"
+sed '/^enable_javascript:/d; /^font_size:/d; /^font_min_size:/d' "$choices" >"$choices.touch"
+printf 'enable_javascript:1\nfont_size:200\nfont_min_size:180\n' >>"$choices.touch"
+mv "$choices.touch" "$choices"
+export LD_PRELOAD=/usr/local/lib/libkindle-touch-browser.so
+exec /usr/bin/netsurf-gtk3 "${1:-http://127.0.0.1:8765/archive}"

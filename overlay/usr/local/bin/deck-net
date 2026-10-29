@@ -1,0 +1,163 @@
+#!/bin/sh
+# Userspace Tailscale. No TUN device, so the Kindle's own routing stays as
+# Amazon left it. SSH reaches the tailnet through `tailscale nc`, not a tunnel.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+TS=/usr/sbin/tailscaled
+TC=/usr/bin/tailscale
+SOCK=/run/tailscale/tailscaled.sock
+STATE=/var/lib/tailscale
+LOG=/mnt/kindle/linux/tailscale.log
+UPLOG=/mnt/kindle/linux/tailscale-up.txt
+
+deck_net_say() {
+	printf '%s\n' "$*"
+	printf '%s\n' "$*" >>"$LOG" 2>/dev/null
+}
+
+# JSON status identifies a responsive daemon even when it is logged out.
+# Human-readable error strings vary between releases.
+deck_net_daemon_up() {
+	[ -S "$SOCK" ] || return 1
+	[ -x "$TC" ] || return 1
+	out=$(timeout 5 "$TC" --socket="$SOCK" status --json 2>/dev/null)
+	printf '%s\n' "$out" | grep -q '"BackendState"[[:space:]]*:'
+}
+
+deck_net_prepare() {
+	mkdir -p /run/tailscale "$STATE" "$(dirname "$LOG")" 2>/dev/null
+	chmod 755 /run/tailscale 2>/dev/null
+	chmod 700 "$STATE" 2>/dev/null
+	touch "$LOG" 2>/dev/null
+
+	if deck_net_daemon_up; then
+		deck_net_say "Tailscale is already running."
+		return 0
+	fi
+
+	if [ -S "$SOCK" ] || pidof tailscaled >/dev/null 2>&1; then
+		deck_net_say "Clearing a stuck tailscaled."
+		killall tailscaled 2>/dev/null
+		sleep 1
+		rm -f "$SOCK"
+	fi
+
+	if [ ! -x "$TS" ]; then
+		deck_net_say "Missing $TS"
+		return 1
+	fi
+
+	if ! awk 'NR>1 && $2=="00000000" { found=1 } END { exit !found }' /proc/net/route 2>/dev/null; then
+		deck_net_say "No Wi-Fi route. Tailscale cannot reach the login server."
+	else
+		deck_net_say "Checking the Tailscale login server..."
+		code=$(/usr/bin/curl -m 10 -sS -o /dev/null -w '%{http_code}' https://controlplane.tailscale.com 2>>"$LOG" || true)
+		case "$code" in
+		000|"") deck_net_say "Could not reach controlplane.tailscale.com." ;;
+		*) deck_net_say "Login server answered (HTTP $code)." ;;
+		esac
+	fi
+
+	deck_net_say "Starting tailscaled (userspace, no TUN)..."
+	# Firewall mode off: this kernel has no TUN, and programming nftables
+	# from the chroot hangs or fails. State encryption stays off because
+	# this board has no TPM. A hung probe there never opens the socket.
+	TS_DEBUG_FIREWALL_MODE=off \
+		nohup "$TS" \
+		--tun=userspace-networking \
+		--statedir="$STATE" \
+		--state="$STATE/tailscaled.state" \
+		--socket="$SOCK" \
+		--socks5-server=127.0.0.1:1055 \
+		--encrypt-state=false \
+		--no-logs-no-support \
+		--verbose=1 \
+		</dev/null >>"$LOG" 2>&1 &
+	pid=$!
+	deck_net_say "tailscaled pid $pid"
+	sleep 1
+	if ! kill -0 "$pid" 2>/dev/null && ! deck_net_daemon_up; then
+		deck_net_say "tailscaled exited immediately. Last log lines:"
+		tail -n 30 "$LOG" 2>/dev/null
+		return 1
+	fi
+
+	i=0
+	while [ "$i" -lt 20 ]; do
+		if deck_net_daemon_up; then
+			deck_net_say "tailscaled is up."
+			return 0
+		fi
+		i=$((i + 1))
+		deck_net_say "  waiting for tailscaled ($i/20)"
+		sleep 1
+	done
+	deck_net_say "tailscaled did not open $SOCK. Last log lines:"
+	tail -n 30 "$LOG" 2>/dev/null
+	return 1
+}
+
+deck_net_ready() {
+	deck_net_prepare || return 1
+	if "$TC" --socket="$SOCK" status >/dev/null 2>&1; then
+		return 0
+	fi
+	echo "This Kindle is not on the tailnet yet."
+	echo "Choose 7 and open the URL it prints."
+	return 1
+}
+
+deck_net_login() {
+	: >"$UPLOG" 2>/dev/null
+	echo "===== $(date) tailscale up =====" >>"$LOG" 2>/dev/null
+
+	# tailscale up prints nothing until the control server answers.
+	# A heartbeat keeps the e-ink panel changing, then stops once the
+	# URL is in the log so the URL stays on screen.
+	(
+		n=0
+		while [ "$n" -lt 90 ]; do
+			sleep 2
+			n=$((n + 1))
+			if grep -q 'https://login.tailscale.com/' "$UPLOG" 2>/dev/null; then
+				exit 0
+			fi
+			printf '  still waiting for the login URL (%ss)\n' "$((n * 2))"
+		done
+	) &
+	beat=$!
+
+	tail -n +1 -f "$UPLOG" 2>/dev/null &
+	follow=$!
+	sleep 1
+
+	"$TC" --socket="$SOCK" up \
+		--reset \
+		--timeout=3m \
+		--hostname=kindle \
+		--accept-dns=false \
+		--accept-routes=false \
+		--netfilter-mode=off \
+		>>"$UPLOG" 2>&1
+	kill "$beat" "$follow" 2>/dev/null
+	wait "$beat" 2>/dev/null
+	wait "$follow" 2>/dev/null
+	cat "$UPLOG" >>"$LOG" 2>/dev/null
+
+	url=$(grep -o 'https://login.tailscale.com/[^[:space:]]*' "$UPLOG" 2>/dev/null | tail -n 1)
+	echo
+	if [ -n "$url" ]; then
+		echo "OPEN THIS IN A BROWSER:"
+		echo "$url"
+		echo
+	fi
+	if "$TC" --socket="$SOCK" status >/dev/null 2>&1; then
+		echo "This Kindle is on the tailnet."
+		echo
+		"$TC" --socket="$SOCK" status
+		return 0
+	fi
+	echo "Not on the tailnet yet."
+	echo "Open the URL, approve the machine named kindle, then choose 7 again."
+	return 1
+}

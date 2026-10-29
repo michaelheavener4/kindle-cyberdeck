@@ -1,0 +1,17 @@
+#!/bin/sh
+# Reuse the desktop bus when a helper is invoked over SSH. Do not autolaunch
+# a second session bus (and a second keyboard) from a remote terminal.
+export DISPLAY="${DISPLAY:-:1}"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export HOME=/home/alpine
+export GSETTINGS_BACKEND=keyfile
+export NO_AT_BRIDGE=1
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+  for session_pid in $(pidof jwm 2>/dev/null); do
+    session_bus=$(tr '\000' '\n' <"/proc/$session_pid/environ" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')
+    if [ -n "$session_bus" ]; then
+      export DBUS_SESSION_BUS_ADDRESS="$session_bus"
+      break
+    fi
+  done
+fi

@@ -1,0 +1,645 @@
+#!/usr/bin/python3
+"""Move the Alpine pointer from a USB mouse.
+
+Xephyr often never sees a mouse plugged in after it starts. This process
+grabs only relative mice and injects motion with XTest. Touchscreens and
+keyboards are left alone. It also installs a 64px cursor, because the
+panel is about 300 ppi and the default cursor is a speck.
+
+USB host mode on this Paperwhite is unproven. If no mouse enumerates,
+this process just keeps the large cursor on the touch pointer.
+"""
+import array
+import ctypes
+import fcntl
+import glob
+import os
+import select
+import signal
+import struct
+import sys
+import time
+
+EV_KEY = 1
+EV_REL = 2
+EVIOCGRAB = (1 << 30) | (4 << 16) | (ord("E") << 8) | 0x90
+EVIOCGBIT_KEY = (2 << 30) | (96 << 16) | (ord("E") << 8) | 0x21
+EVIOCGBIT_REL = (2 << 30) | (16 << 16) | (ord("E") << 8) | 0x22
+EVIOCGBIT_ABS = (2 << 30) | (16 << 16) | (ord("E") << 8) | 0x23
+EVIOCGNAME = (2 << 30) | (256 << 16) | (ord("E") << 8) | 0x06
+KEY_A = 30
+BTN_LEFT = 0x110
+BTN_RIGHT = 0x111
+BTN_MIDDLE = 0x112
+ABS_MT_SLOT = 0x2F
+REL_X = 0
+REL_Y = 1
+REL_WHEEL = 8
+SCALE = 3
+SKIP_NAMES = (
+    "touch",
+    "goodix",
+    "mtk-tpd",
+    "zinitix",
+    "cypress",
+    "wacom",
+    "cyttsp",
+    "ilitek",
+    "focal",
+    "himax",
+    "gpio-keys",
+    "power",
+)
+CURSOR_NAMES = (
+    "left_ptr",
+    "default",
+    "arrow",
+    "top_left_arrow",
+    "right_ptr",
+    "hand",
+    "hand1",
+    "hand2",
+    "pointer",
+    "xterm",
+    "ibeam",
+    "text",
+    "crosshair",
+    "fleur",
+    "move",
+    "sb_v_double_arrow",
+    "sb_h_double_arrow",
+    "watch",
+    "wait",
+    "progress",
+    "plus",
+    "question_arrow",
+)
+# Tip at (10, 6). Sized for a 64px image.
+ARROW = ((10, 6), (10, 42), (22, 32), (32, 56), (42, 48), (30, 28), (52, 28))
+HOT_X = 10
+HOT_Y = 6
+CURSOR_SIZE = 64
+
+RUNNING = True
+
+
+def log(msg):
+    line = time.strftime("%Y-%m-%d %H:%M:%S") + " deck-pointer: " + msg + "\n"
+    for path in ("/mnt/kindle/linux/pointer.log", "/tmp/deck-pointer.log"):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+            return
+        except OSError:
+            continue
+    sys.stderr.write(line)
+
+
+def bit_set(bits, code):
+    if code < 0 or code // 8 >= len(bits):
+        return False
+    return bool(bits[code // 8] & (1 << (code % 8)))
+
+
+def point_inside(x, y, poly):
+    hit = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > y) != (yj > y):
+            cross = (xj - xi) * (y - yi) / float(yj - yi) + xi
+            if x < cross:
+                hit = not hit
+        j = i
+    return hit
+
+
+def arrow_layers(size=CURSOR_SIZE):
+    """Return (black, white) sets. White is a halo so the arrow shows on gray."""
+    black = set()
+    for y in range(size):
+        for x in range(size):
+            if point_inside(x + 0.5, y + 0.5, ARROW):
+                black.add((x, y))
+    white = set()
+    for x, y in black:
+        for dy in range(-3, 4):
+            for dx in range(-3, 4):
+                px, py = x + dx, y + dy
+                if 0 <= px < size and 0 <= py < size and (px, py) not in black:
+                    white.add((px, py))
+    return black, white
+
+
+def xcursor_bytes(size, pixels, xhot, yhot):
+    """One Xcursor image. pixels are ARGB ints, row-major."""
+    header = struct.pack("<IIII", 0x72756358, 16, 0x00010000, 1)
+    toc = struct.pack("<III", 0xFFFD0002, size, 28)
+    chunk = struct.pack(
+        "<IIIIIIIII",
+        36,
+        0xFFFD0002,
+        size,
+        1,
+        size,
+        size,
+        xhot,
+        yhot,
+        0,
+    )
+    pix = struct.pack("<%dI" % (size * size), *pixels)
+    return header + toc + chunk + pix
+
+
+def arrow_cursor_bytes():
+    black, white = arrow_layers()
+    pixels = []
+    for y in range(CURSOR_SIZE):
+        for x in range(CURSOR_SIZE):
+            if (x, y) in black:
+                pixels.append(0xFF000000)
+            elif (x, y) in white:
+                pixels.append(0xFFFFFFFF)
+            else:
+                pixels.append(0)
+    return xcursor_bytes(CURSOR_SIZE, pixels, HOT_X, HOT_Y)
+
+
+def install_cursors(root="/tmp/kindle-cursors"):
+    dest = os.path.join(root, "kindle", "cursors")
+    os.makedirs(dest, exist_ok=True)
+    blob = arrow_cursor_bytes()
+    target = os.path.join(dest, "left_ptr")
+    with open(target, "wb") as fh:
+        fh.write(blob)
+    for name in CURSOR_NAMES:
+        path = os.path.join(dest, name)
+        if name == "left_ptr":
+            continue
+        if os.path.lexists(path):
+            os.remove(path)
+        os.symlink("left_ptr", path)
+    theme = os.path.join(root, "kindle", "index.theme")
+    with open(theme, "w", encoding="utf-8") as fh:
+        fh.write("[Icon Theme]\nName=kindle\nComment=Large e-ink pointer\nInherits=hicolor\n")
+    return root
+
+
+def event_size_of(blob):
+    if len(blob) >= 16 and _plausible(blob, 16):
+        return 16
+    if len(blob) >= 24 and _plausible(blob, 24):
+        return 24
+    return None
+
+
+def _plausible(blob, size):
+    fmt = "<IIHHi" if size == 16 else "<QQHHi"
+    _sec, _usec, typ, code, _value = struct.unpack_from(fmt, blob, 0)
+    return typ <= 31 and code <= 0x2FF
+
+
+def unpack_events(blob, size):
+    fmt = "<IIHHi" if size == 16 else "<QQHHi"
+    step = struct.calcsize(fmt)
+    out = []
+    for off in range(0, len(blob) - step + 1, step):
+        _sec, _usec, typ, code, value = struct.unpack_from(fmt, blob, off)
+        out.append((typ, code, value))
+    return out
+
+
+def scale_delta(value):
+    moved = value * SCALE
+    if moved > 120:
+        return 120
+    if moved < -120:
+        return -120
+    return moved
+
+
+class XPointer:
+    def __init__(self):
+        self.x11 = ctypes.CDLL("libX11.so.6")
+        self.xtst = ctypes.CDLL("libXtst.so.6")
+        self._bind()
+        self.dpy = self.x11.XOpenDisplay(None)
+        if not self.dpy:
+            raise OSError("XOpenDisplay failed")
+        self.screen = self.x11.XDefaultScreen(self.dpy)
+        self.root = self.x11.XDefaultRootWindow(self.dpy)
+        self.cursor = self._make_cursor()
+        self.last_window = None
+        self.last_define = 0
+
+    def _bind(self):
+        x11 = self.x11
+        xtst = self.xtst
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+        x11.XDefaultScreen.restype = ctypes.c_int
+        x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x11.XDefaultColormap.restype = ctypes.c_ulong
+        x11.XDefaultColormap.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XBlackPixel.restype = ctypes.c_ulong
+        x11.XBlackPixel.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XWhitePixel.restype = ctypes.c_ulong
+        x11.XWhitePixel.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XCreatePixmap.restype = ctypes.c_ulong
+        x11.XCreatePixmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        x11.XFreePixmap.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x11.XCreateGC.restype = ctypes.c_void_p
+        x11.XCreateGC.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+        ]
+        x11.XFreeGC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        x11.XSetForeground.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+        x11.XFillRectangle.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        x11.XDrawPoint.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        x11.XCreatePixmapCursor.restype = ctypes.c_ulong
+        x11.XCreatePixmapCursor.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        x11.XDefineCursor.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+        x11.XQueryPointer.restype = ctypes.c_int
+        x11.XQueryPointer.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        xtst.XTestFakeRelativeMotionEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        xtst.XTestFakeButtonEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+
+    def _color(self, pixel, red, green, blue):
+        color = XColor()
+        color.pixel = pixel
+        color.red = red
+        color.green = green
+        color.blue = blue
+        color.flags = 7
+        return color
+
+    def _make_cursor(self):
+        black, white = arrow_layers()
+        source = self.x11.XCreatePixmap(self.dpy, self.root, CURSOR_SIZE, CURSOR_SIZE, 1)
+        mask = self.x11.XCreatePixmap(self.dpy, self.root, CURSOR_SIZE, CURSOR_SIZE, 1)
+        gc = self.x11.XCreateGC(self.dpy, source, 0, None)
+        self.x11.XSetForeground(self.dpy, gc, 0)
+        self.x11.XFillRectangle(self.dpy, source, gc, 0, 0, CURSOR_SIZE, CURSOR_SIZE)
+        self.x11.XFillRectangle(self.dpy, mask, gc, 0, 0, CURSOR_SIZE, CURSOR_SIZE)
+        self.x11.XSetForeground(self.dpy, gc, 1)
+        for x, y in white:
+            self.x11.XDrawPoint(self.dpy, mask, gc, x, y)
+        for x, y in black:
+            self.x11.XDrawPoint(self.dpy, source, gc, x, y)
+            self.x11.XDrawPoint(self.dpy, mask, gc, x, y)
+        fg = self._color(self.x11.XBlackPixel(self.dpy, self.screen), 0, 0, 0)
+        bg = self._color(self.x11.XWhitePixel(self.dpy, self.screen), 65535, 65535, 65535)
+        cursor = self.x11.XCreatePixmapCursor(
+            self.dpy,
+            source,
+            mask,
+            ctypes.byref(fg),
+            ctypes.byref(bg),
+            HOT_X,
+            HOT_Y,
+        )
+        self.x11.XFreeGC(self.dpy, gc)
+        self.x11.XFreePixmap(self.dpy, source)
+        self.x11.XFreePixmap(self.dpy, mask)
+        if cursor:
+            self.x11.XDefineCursor(self.dpy, self.root, cursor)
+            self.x11.XFlush(self.dpy)
+            log("installed a %dpx pointer" % CURSOR_SIZE)
+        else:
+            log("pixmap cursor was not created")
+        return cursor
+
+    def follow_window(self, force=False):
+        if not self.cursor:
+            return
+        now = time.time()
+        if not force and now - self.last_define < 2:
+            return
+        win = self.root
+        root_ret = ctypes.c_ulong()
+        child = ctypes.c_ulong()
+        rx = ctypes.c_int()
+        ry = ctypes.c_int()
+        wx = ctypes.c_int()
+        wy = ctypes.c_int()
+        mask = ctypes.c_uint()
+        for _step in range(8):
+            child.value = 0
+            ok = self.x11.XQueryPointer(
+                self.dpy,
+                win,
+                ctypes.byref(root_ret),
+                ctypes.byref(child),
+                ctypes.byref(rx),
+                ctypes.byref(ry),
+                ctypes.byref(wx),
+                ctypes.byref(wy),
+                ctypes.byref(mask),
+            )
+            if not ok or not child.value or child.value == win:
+                break
+            win = child.value
+        if force or win != self.last_window or now - self.last_define >= 2:
+            self.x11.XDefineCursor(self.dpy, win, self.cursor)
+            self.x11.XFlush(self.dpy)
+            self.last_window = win
+            self.last_define = now
+
+    def move(self, dx, dy):
+        if dx == 0 and dy == 0:
+            return
+        self.xtst.XTestFakeRelativeMotionEvent(self.dpy, int(dx), int(dy), 0)
+
+    def button(self, number, pressed):
+        self.xtst.XTestFakeButtonEvent(self.dpy, int(number), 1 if pressed else 0, 0)
+
+    def flush(self):
+        self.x11.XFlush(self.dpy)
+
+    def close(self):
+        if self.dpy:
+            self.x11.XCloseDisplay(self.dpy)
+            self.dpy = None
+
+
+class XColor(ctypes.Structure):
+    _fields_ = [
+        ("pixel", ctypes.c_ulong),
+        ("red", ctypes.c_ushort),
+        ("green", ctypes.c_ushort),
+        ("blue", ctypes.c_ushort),
+        ("flags", ctypes.c_ubyte),
+        ("pad", ctypes.c_ubyte),
+    ]
+
+
+class Mice:
+    def __init__(self, pointer):
+        self.pointer = pointer
+        self.boards = {}
+        self.pending = {}
+        self.event_size = None
+        self.skip_ids = set()
+
+    def scan(self):
+        for path in sorted(glob.glob("/dev/input/event*")):
+            if path in self.boards:
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            ident = (st.st_rdev, st.st_ino)
+            if ident in self.skip_ids:
+                continue
+            self._consider(path, ident)
+
+    def _name(self, fd):
+        buf = array.array("B", [0] * 256)
+        try:
+            fcntl.ioctl(fd, EVIOCGNAME, buf, True)
+        except OSError:
+            return ""
+        return buf.tobytes().split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+    def _bits(self, fd, request, count):
+        bits = array.array("B", [0] * count)
+        fcntl.ioctl(fd, request, bits, True)
+        return bits
+
+    def _consider(self, path, ident):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as exc:
+            log("open %s failed: %s" % (path, exc))
+            self.skip_ids.add(ident)
+            return
+        name = self._name(fd)
+        lowered = name.lower()
+        if any(part in lowered for part in SKIP_NAMES):
+            os.close(fd)
+            self.skip_ids.add(ident)
+            return
+        try:
+            keys = self._bits(fd, EVIOCGBIT_KEY, 96)
+            rel = self._bits(fd, EVIOCGBIT_REL, 16)
+            abits = self._bits(fd, EVIOCGBIT_ABS, 16)
+        except OSError as exc:
+            os.close(fd)
+            self.skip_ids.add(ident)
+            log("bitmap %s failed: %s" % (path, exc))
+            return
+        mouse = (
+            bit_set(rel, REL_X)
+            and bit_set(rel, REL_Y)
+            and bit_set(keys, BTN_LEFT)
+            and not bit_set(keys, KEY_A)
+            and not bit_set(abits, ABS_MT_SLOT)
+        )
+        if not mouse:
+            os.close(fd)
+            self.skip_ids.add(ident)
+            return
+        try:
+            fcntl.ioctl(fd, EVIOCGRAB, 1)
+        except OSError as exc:
+            os.close(fd)
+            self.skip_ids.add(ident)
+            log("could not grab %s (%s): %s" % (path, name, exc))
+            return
+        self.boards[path] = fd
+        self.pending[fd] = b""
+        log("grabbed mouse %s name=%s" % (path, name))
+
+    def read(self, fd):
+        try:
+            data = os.read(fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            self.drop(fd)
+            return
+        if not data:
+            self.drop(fd)
+            return
+        blob = self.pending.get(fd, b"") + data
+        size = self.event_size
+        if size is None:
+            size = event_size_of(blob)
+            if size is None:
+                self.pending[fd] = blob[-24:]
+                return
+            self.event_size = size
+            log("input event size %d" % size)
+        whole = len(blob) - (len(blob) % size)
+        self.pending[fd] = blob[whole:]
+        dx = dy = 0
+        for typ, code, value in unpack_events(blob[:whole], size):
+            if typ == EV_REL and code == REL_X:
+                dx += scale_delta(value)
+            elif typ == EV_REL and code == REL_Y:
+                dy += scale_delta(value)
+            elif typ == EV_REL and code == REL_WHEEL:
+                button = 4 if value > 0 else 5
+                for _step in range(min(abs(value), 4)):
+                    self.pointer.button(button, True)
+                    self.pointer.button(button, False)
+            elif typ == EV_KEY and value in (0, 1):
+                mapped = {BTN_LEFT: 1, BTN_RIGHT: 3, BTN_MIDDLE: 2}.get(code)
+                if mapped:
+                    self.pointer.button(mapped, value == 1)
+        if dx or dy:
+            self.pointer.move(dx, dy)
+        self.pointer.flush()
+
+    def drop(self, fd):
+        path = None
+        for candidate, held in list(self.boards.items()):
+            if held == fd:
+                path = candidate
+                break
+        if path is not None:
+            del self.boards[path]
+        self.pending.pop(fd, None)
+        try:
+            fcntl.ioctl(fd, EVIOCGRAB, 0)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        log("released %s" % (path or fd))
+
+    def close(self):
+        for fd in list(self.pending):
+            self.drop(fd)
+
+
+def _stop(_signum, _frame):
+    global RUNNING
+    RUNNING = False
+
+
+def run_pointer():
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    try:
+        pointer = XPointer()
+    except OSError as exc:
+        log("no pointer: %s" % exc)
+        return 1
+    mice = Mice(pointer)
+    pointer.follow_window(force=True)
+    try:
+        while RUNNING:
+            mice.scan()
+            fds = list(mice.boards.values())
+            try:
+                ready, _, _ = select.select(fds, [], [], 0.3) if fds else ([], [], [])
+            except InterruptedError:
+                continue
+            if not fds:
+                time.sleep(0.3)
+            for fd in ready:
+                mice.read(fd)
+            pointer.follow_window()
+    finally:
+        mice.close()
+        pointer.close()
+    return 0
+
+
+def self_test():
+    assert EVIOCGRAB == 0x40044590
+    assert EVIOCGBIT_REL == 0x80104522
+    assert EVIOCGBIT_ABS == 0x80104523
+    assert scale_delta(1) == 3
+    assert scale_delta(100) == 120
+    assert scale_delta(-100) == -120
+    assert point_inside(12, 10, ARROW)
+    assert not point_inside(0, 0, ARROW)
+    black, white = arrow_layers()
+    assert black
+    assert white
+    assert point_inside(HOT_X + 2, HOT_Y + 8, ARROW)
+    blob = arrow_cursor_bytes()
+    assert blob[:4] == b"Xcur"
+    assert event_size_of(struct.pack("<IIHHi", 1, 2, EV_REL, REL_X, 4)) == 16
+    root = install_cursors("/tmp/kindle-cursors-test")
+    path = os.path.join(root, "kindle", "cursors", "left_ptr")
+    lib = ctypes.CDLL("libXcursor.so.1")
+    lib.XcursorFilenameLoadImage.restype = ctypes.c_void_p
+    lib.XcursorFilenameLoadImage.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    lib.XcursorImageDestroy.argtypes = [ctypes.c_void_p]
+    image = lib.XcursorFilenameLoadImage(path.encode(), 64)
+    assert image, "Xcursor rejected the pointer file"
+    lib.XcursorImageDestroy(image)
+    print("deck-pointer self-test ok")
+    return 0
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(self_test())
+    if "--install-cursors" in sys.argv:
+        print(install_cursors())
+        raise SystemExit(0)
+    raise SystemExit(run_pointer())

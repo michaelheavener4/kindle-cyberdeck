@@ -1,0 +1,4 @@
+#!/usr/bin/python3
+from kindle_books.books import main
+
+raise SystemExit(main())

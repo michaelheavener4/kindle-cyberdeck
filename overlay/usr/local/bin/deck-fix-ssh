@@ -1,0 +1,42 @@
+#!/bin/sh
+# The GUI runs as root with HOME=/home/alpine. OpenSSH uses passwd's home.
+set -eu
+[ "$(id -u)" = 0 ] || { echo 'Run this inside the Kindle Linux terminal as root.' >&2; exit 1; }
+[ -f /home/alpine/.ssh/id_ed25519 ] || { echo 'Kindle SSH key is missing.' >&2; exit 1; }
+root_home=$(awk -F: '$1 == "root" { print $6; exit }' /etc/passwd)
+[ -n "$root_home" ] && [ "$root_home" != / ] || exit 1
+ssh_dir="$root_home/.ssh"
+mkdir -p "$ssh_dir"
+chmod 700 "$ssh_dir"
+cat >"$ssh_dir/cyberdeck.conf.new" <<'EOF'
+Host omarchy
+  HostName omarchy.example.invalid
+  User zephyrillius
+
+Host mac
+  HostName mac.example.invalid
+  User a.
+
+Host omarchy mac
+  IdentityFile /home/alpine/.ssh/id_ed25519
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+  ServerAliveInterval 15
+  ServerAliveCountMax 4
+  ProxyCommand /usr/bin/tailscale --socket=/run/tailscale/tailscaled.sock nc %h %p
+EOF
+chmod 600 "$ssh_dir/cyberdeck.conf.new"
+mv "$ssh_dir/cyberdeck.conf.new" "$ssh_dir/cyberdeck.conf"
+include="Include $ssh_dir/cyberdeck.conf"
+if [ ! -f "$ssh_dir/config" ] || [ "$(head -n 1 "$ssh_dir/config")" != "$include" ]; then
+  if [ -f "$ssh_dir/config" ]; then
+    cp -p "$ssh_dir/config" "$ssh_dir/config.before-cyberdeck-$(date +%s)"
+  fi
+  {
+    printf '%s\n\n' "$include"
+    if [ -f "$ssh_dir/config" ]; then cat "$ssh_dir/config"; fi
+  } >"$ssh_dir/config.new"
+  chmod 600 "$ssh_dir/config.new"
+  mv "$ssh_dir/config.new" "$ssh_dir/config"
+fi
+echo 'Cyberdeck SSH settings installed for root. Try menu option 5.'

@@ -1,0 +1,25 @@
+#!/usr/bin/python3
+"""Temporary power-key bridge for the current old-style Linux session only."""
+import os
+import select
+import struct
+import subprocess
+import time
+
+event=struct.Struct('llHHi')
+device='/dev/input/event0'
+started=None
+with open(device,'rb',buffering=0) as stream:
+    while True:
+        select.select([stream],[],[])
+        data=stream.read(event.size)
+        if len(data)!=event.size:break
+        _,_,kind,code,value=event.unpack(data)
+        if kind!=1 or code!=116:continue
+        if value==1:started=time.monotonic()
+        elif value==0 and started is not None:
+            short=time.monotonic()-started<2;started=None
+            if not short:continue
+            state=subprocess.run(['chroot','/proc/1/root','/usr/bin/lipc-get-prop','com.lab126.powerd','preventScreenSaver'],capture_output=True,text=True,timeout=3)
+            if state.stdout.strip()=='1':
+                subprocess.Popen(['/usr/local/bin/deck-exit','sleep']);break

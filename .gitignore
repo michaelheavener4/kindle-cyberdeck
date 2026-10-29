@@ -1,0 +1,14 @@
+release/
+build/
+*.ext3
+*.img
+id_ed25519
+id_ed25519.pub
+*.gb
+*.gbc
+*.sav
+lichess.token
+
+__pycache__/
+*.py[cod]
+backups/
