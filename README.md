@@ -1,5 +1,7 @@
 # Kindle cyberdeck
 
+**Configuration:** The `*.example.invalid` hostnames in this repository are placeholders. Configure them for your own Kindle, Omarchy computer, and Mac before using network features or building a device image.
+
 Alpine Linux session for this jailbroken Kindle Paperwhite 6 (Sangria, firmware 5.20.1.0.2).
 
 Amazon's kernel stays. It is the only kernel with drivers for this panel, the touchscreen, and Wi-Fi. There is no postmarketOS or mainline port for Bellatrix4, and flashing another Kindle's firmware would brick it. The Linux book stops the Amazon reader and store, then starts this chroot. Exit, or a reboot, brings the Kindle UI back. Doom, the jailbreak, and the OTA filler files are not modified.
